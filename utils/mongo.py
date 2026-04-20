@@ -71,11 +71,17 @@ def query_recipients(
 ) -> List[Dict[str, Any]]:
     """Find recipients matching the targeting query.
 
-    Mirrors cold-api's recipient_service.get_filtered_recipients_count_only:
-    excludes 'Unsubscribed' status so the personalizer works on the same set
+    Cluster: recipients live on the READ cluster (cluster0.725a4j4) —
+    verified directly: the PRIMARY cluster returns 0 recipients for an org's
+    tags while READ returns the real count. cold-api's recipient_service
+    uses `clients.read_motor_db.recipients` for the same reason. An earlier
+    version of this function used _get_primary_db() and the ECS task found
+    0 recipients every time.
+
+    Filter: excludes Unsubscribed so the personalizer works on the same set
     the cost-estimate endpoint counted.
     """
-    db = _get_primary_db()
+    db = _get_read_db()
     match: Dict[str, Any] = {
         "organization_id": organization_id,
         "status": {"$ne": "Unsubscribed"},
