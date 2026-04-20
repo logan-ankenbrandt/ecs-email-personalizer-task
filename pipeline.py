@@ -177,6 +177,14 @@ class PersonalizerPipeline:
         # In targeted mode, maps recipient_id -> set of steps to run.
         self._target_steps_by_rid: Dict[str, Set[int]] = {}
 
+    @property
+    def is_rewrite(self) -> bool:
+        """True when this run is a targeted rewrite (explicit targets or
+        bulk scope), False for full-batch personalization. Used to gate
+        Mongo writes that would otherwise clobber parent-doc full-batch state.
+        """
+        return bool(self.targets) or self.rewrite_scope in ("recipient", "all")
+
     def run(self) -> Dict[str, Any]:
         """Execute the personalization run. Returns final metadata."""
         # 1. Load sequence + template emails
@@ -218,6 +226,19 @@ class PersonalizerPipeline:
                 raise ValueError(
                     f"Targeted rewrite: no recipients found for ids={target_rids}"
                 )
+            # Bug H1: some recipients may have been deleted between rewrite
+            # creation and ECS task start. Log the missing ids and record them
+            # as failed so the final metadata reflects reality instead of
+            # silently dropping them.
+            found_rids = {str(r["_id"]) for r in self.recipients}
+            missing_rids = set(target_rids) - found_rids
+            if missing_rids:
+                logger.warning(
+                    "Targeted rewrite: %d of %d requested recipients not found "
+                    "(deleted?): %s",
+                    len(missing_rids), len(target_rids), sorted(missing_rids)[:10],
+                )
+                self.failed_ids.update(missing_rids)
             # Per-recipient step filter (used inside _personalize_one_recipient).
             self._target_steps_by_rid = {}
             for t in self.targets:
@@ -262,10 +283,15 @@ class PersonalizerPipeline:
                 )
 
         # 4. Initialize tracking on the parent doc
+        # Bug C3: rewrite runs must NOT overwrite the parent sequence's
+        # personalization_progress counters. The init helper splits behavior
+        # based on is_rewrite: full-batch resets the top-level state, rewrites
+        # only update the matching rewrite_runs[] entry.
         init_personalization_run(
             sequence_id=self.sequence_id,
             personalization_run_id=self.personalization_run_id,
             total=len(self.recipients) + len(self.completed_ids),
+            is_rewrite=self.is_rewrite,
         )
 
         # 5. Process recipients in parallel
@@ -282,6 +308,7 @@ class PersonalizerPipeline:
             failed=len(self.failed_ids),
             metadata=metadata,
             personalization_run_id=self.personalization_run_id,
+            is_rewrite=self.is_rewrite,
         )
         write_checkpoint(
             bucket=S3_BUCKET,
@@ -326,6 +353,8 @@ class PersonalizerPipeline:
                         sequence_id=self.sequence_id,
                         completed=len(self.completed_ids),
                         failed=len(self.failed_ids),
+                        is_rewrite=self.is_rewrite,
+                        personalization_run_id=self.personalization_run_id,
                     )
                     write_checkpoint(
                         bucket=S3_BUCKET,
@@ -587,6 +616,7 @@ class PersonalizerPipeline:
             original_template_id=template_id,
             dimension_scores=final_judgment.get("dimension_scores") if final_judgment else None,
             previous_version=previous_version,
+            last_rewrite_feedback=self.feedback,
         )
         return ok
 
@@ -607,7 +637,14 @@ class PersonalizerPipeline:
         from utils.mongo import _get_primary_db
         db = _get_primary_db()
         query: Dict[str, Any] = {"email_sequence_id": str(self.sequence_id)}
-        if self.rewrite_scope == "recipient" and self.rewrite_recipient_id:
+        if self.rewrite_scope == "recipient":
+            # Bug C1: guard against missing/empty recipient_id silently
+            # expanding to an all-sequence rewrite.
+            if not self.rewrite_recipient_id:
+                raise ValueError(
+                    "rewrite_scope='recipient' requires a non-empty "
+                    f"rewrite_recipient_id but got {self.rewrite_recipient_id!r}"
+                )
             query["recipient_id"] = str(self.rewrite_recipient_id)
         cursor = db.personalized_sequence_emails.find(
             query, {"recipient_id": 1, "step": 1, "_id": 0},

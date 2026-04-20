@@ -80,6 +80,37 @@ def main() -> None:
         except json.JSONDecodeError as e:
             print(f"Invalid --targets JSON: {e}", file=sys.stderr)
             sys.exit(2)
+        # Shape validation (Bug H2). Each entry must be {recipient_id: str, step: int}.
+        if not isinstance(parsed_targets, list):
+            print("--targets must be a JSON array", file=sys.stderr)
+            sys.exit(2)
+        for i, item in enumerate(parsed_targets):
+            if not isinstance(item, dict):
+                print(f"--targets[{i}]: must be an object", file=sys.stderr)
+                sys.exit(2)
+            if "recipient_id" not in item or not isinstance(item["recipient_id"], str):
+                print(f"--targets[{i}]: missing or non-string 'recipient_id'", file=sys.stderr)
+                sys.exit(2)
+            if "step" not in item:
+                print(f"--targets[{i}]: missing 'step'", file=sys.stderr)
+                sys.exit(2)
+            try:
+                int(item["step"])
+            except (TypeError, ValueError):
+                print(
+                    f"--targets[{i}]: 'step' must be int-coercible, got {item['step']!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+
+    # Bug C1: scope=recipient requires a recipient id; otherwise the pipeline
+    # silently rewrites every personalized doc for the sequence.
+    if args.rewrite_scope == "recipient" and not args.rewrite_recipient_id:
+        print(
+            "Error: --rewrite_scope=recipient requires --rewrite_recipient_id",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # Bulk scopes ignore --targets (the pipeline resolves them from Mongo).
     if args.rewrite_scope in ("recipient", "all") and parsed_targets:
@@ -130,12 +161,15 @@ def main() -> None:
         # Try to mark the run as failed in Mongo so the UI sees status="failed"
         try:
             from utils.mongo import finalize_personalization_run
+            # Early crash before pipeline.run(): infer is_rewrite from CLI args.
+            is_rewrite_top = bool(parsed_targets) or args.rewrite_scope in ("recipient", "all")
             finalize_personalization_run(
                 sequence_id=args.sequence_id,
                 completed=0, failed=0,
                 metadata={"error_type": type(e).__name__},
                 error=str(e),
                 personalization_run_id=args.personalization_run_id,
+                is_rewrite=is_rewrite_top,
             )
         except Exception:
             pass
