@@ -151,6 +151,8 @@ class PersonalizerPipeline:
         resume: bool = False,
         targets: Optional[List[Dict[str, Any]]] = None,
         feedback: Optional[str] = None,
+        rewrite_scope: Optional[str] = None,
+        rewrite_recipient_id: Optional[str] = None,
     ):
         self.org_id = org_id
         self.sequence_id = sequence_id
@@ -160,6 +162,8 @@ class PersonalizerPipeline:
         self.resume = resume
         self.targets = targets
         self.feedback = feedback
+        self.rewrite_scope = rewrite_scope
+        self.rewrite_recipient_id = rewrite_recipient_id
 
         self.cost = CostAccumulator()
         self.system_prompt = _load_system_prompt()
@@ -187,7 +191,25 @@ class PersonalizerPipeline:
             self.sequence_doc.get("name"), len(self.template_emails),
         )
 
-        # 2. Resolve recipients. Targeted mode: fetch by ID list. Full mode:
+        # 2a. Bulk-scope rewrite: resolve targets from existing personalized
+        # docs at runtime (avoids shipping a 90KB targets JSON through ECS).
+        # Runs BEFORE the explicit-targets branch so the rest of the pipeline
+        # proceeds identically in both cases.
+        if self.rewrite_scope in ("recipient", "all"):
+            self.targets = self._resolve_targets_from_scope()
+            if not self.targets:
+                raise ValueError(
+                    f"Scope '{self.rewrite_scope}' resolved zero targets for "
+                    f"sequence {self.sequence_id}"
+                )
+            logger.info(
+                "Bulk rewrite scope=%s: resolved %d targets (%d unique recipients)",
+                self.rewrite_scope,
+                len(self.targets),
+                len({t["recipient_id"] for t in self.targets}),
+            )
+
+        # 2b. Resolve recipients. Targeted mode: fetch by ID list. Full mode:
         #    query by sequence.tags.
         if self.targets:
             target_rids = sorted({t["recipient_id"] for t in self.targets})
@@ -571,6 +593,29 @@ class PersonalizerPipeline:
     # ────────────────────────────────────────────────────────────
     # Targeted-rewrite helpers
     # ────────────────────────────────────────────────────────────
+
+    def _resolve_targets_from_scope(self) -> List[Dict[str, Any]]:
+        """Build the target list for a bulk-scope rewrite by querying the
+        existing personalized_sequence_emails docs for this sequence.
+
+        - scope='recipient': filters by recipient_id
+        - scope='all': no recipient filter
+
+        Projects only (recipient_id, step) fields. Returns a plain list of
+        dicts compatible with the rest of the targeted-rewrite pipeline.
+        """
+        from utils.mongo import _get_primary_db
+        db = _get_primary_db()
+        query: Dict[str, Any] = {"email_sequence_id": str(self.sequence_id)}
+        if self.rewrite_scope == "recipient" and self.rewrite_recipient_id:
+            query["recipient_id"] = str(self.rewrite_recipient_id)
+        cursor = db.personalized_sequence_emails.find(
+            query, {"recipient_id": 1, "step": 1, "_id": 0},
+        )
+        return [
+            {"recipient_id": doc["recipient_id"], "step": int(doc["step"])}
+            for doc in cursor
+        ]
 
     def _fetch_recipients_by_ids(
         self, recipient_ids: List[str],

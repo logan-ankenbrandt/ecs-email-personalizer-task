@@ -58,6 +58,18 @@ def main() -> None:
         help="Optional user feedback string injected into the writer prompt "
              "when running a targeted rewrite. Tells the model what to fix.",
     )
+    parser.add_argument(
+        "--rewrite_scope", type=str, default=None,
+        choices=["custom", "recipient", "all"],
+        help="Bulk rewrite scope. When 'recipient' or 'all', the pipeline "
+             "queries personalized_sequence_emails at runtime to build the "
+             "target list, avoiding the ECS command-length limit for large "
+             "target sets. 'custom' (or absent) uses --targets JSON as before.",
+    )
+    parser.add_argument(
+        "--rewrite_recipient_id", type=str, default=None,
+        help="Recipient ID for --rewrite_scope=recipient. Ignored otherwise.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -68,6 +80,14 @@ def main() -> None:
         except json.JSONDecodeError as e:
             print(f"Invalid --targets JSON: {e}", file=sys.stderr)
             sys.exit(2)
+
+    # Bulk scopes ignore --targets (the pipeline resolves them from Mongo).
+    if args.rewrite_scope in ("recipient", "all") and parsed_targets:
+        print(
+            "Warning: --targets ignored when --rewrite_scope is 'recipient' or 'all'",
+            file=sys.stderr,
+        )
+        parsed_targets = None
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
@@ -99,6 +119,8 @@ def main() -> None:
         resume=args.resume,
         targets=parsed_targets,
         feedback=args.feedback,
+        rewrite_scope=args.rewrite_scope,
+        rewrite_recipient_id=args.rewrite_recipient_id,
     )
 
     try:
