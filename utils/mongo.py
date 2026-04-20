@@ -116,9 +116,15 @@ def upsert_personalized_email(
     advisor_used: bool = False,
     original_template_id: Optional[str] = None,
     dimension_scores: Optional[Dict[str, float]] = None,
+    previous_version: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Upsert a per-recipient personalized email. Idempotent on the unique
-    compound index (email_sequence_id, recipient_id, step)."""
+    compound index (email_sequence_id, recipient_id, step).
+
+    When `previous_version` is passed (targeted-rewrite mode), the existing
+    doc's snapshot is appended to `rewrite_history[]` in the same atomic
+    update that sets the new content.
+    """
     db = _get_primary_db()
     doc = {
         "email_sequence_id": email_sequence_id,
@@ -136,6 +142,9 @@ def upsert_personalized_email(
         "advisor_used": advisor_used,
         "dimension_scores": dimension_scores,
     }
+    update_ops: Dict[str, Any] = {"$set": doc}
+    if previous_version:
+        update_ops["$push"] = {"rewrite_history": previous_version}
     try:
         result = db.personalized_sequence_emails.update_one(
             {
@@ -143,7 +152,7 @@ def upsert_personalized_email(
                 "recipient_id": str(recipient_id),
                 "step": step,
             },
-            {"$set": doc},
+            update_ops,
             upsert=True,
         )
         return result.upserted_id is not None or result.modified_count > 0
@@ -161,8 +170,15 @@ def init_personalization_run(
     personalization_run_id: str,
     total: int,
 ) -> None:
-    """Initialize the personalization fields on the email_sequences doc."""
+    """Initialize the personalization fields on the email_sequences doc.
+
+    Also marks the matching rewrite_runs[] entry as running when the
+    personalization_run_id refers to a targeted rewrite (created by
+    create_rewrite_run in cold-api). Full-batch runs have no matching entry,
+    so the second update is a no-op.
+    """
     db = _get_primary_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
     db.email_sequences.update_one(
         {"_id": ObjectId(sequence_id)},
         {
@@ -174,11 +190,18 @@ def init_personalization_run(
                     "completed": 0,
                     "failed": 0,
                 },
-                "personalization_started_at": datetime.now(timezone.utc).isoformat(),
+                "personalization_started_at": now_iso,
                 "personalization_completed_at": None,
                 "personalization_error": None,
             }
         },
+    )
+    db.email_sequences.update_one(
+        {
+            "_id": ObjectId(sequence_id),
+            "rewrite_runs.run_id": personalization_run_id,
+        },
+        {"$set": {"rewrite_runs.$.status": "running"}},
     )
 
 
@@ -206,10 +229,18 @@ def finalize_personalization_run(
     failed: int,
     metadata: Dict[str, Any],
     error: Optional[str] = None,
+    personalization_run_id: Optional[str] = None,
 ) -> None:
-    """Mark the personalization run as completed (or failed) with metadata."""
+    """Mark the personalization run as completed (or failed) with metadata.
+
+    When `personalization_run_id` is provided AND matches an entry in the
+    parent sequence's `rewrite_runs[]` array, that entry is also updated with
+    the terminal status. This makes the status polling endpoint reflect
+    targeted-rewrite completion without a separate write path.
+    """
     db = _get_primary_db()
     status = "failed" if error else "completed"
+    now_iso = datetime.now(timezone.utc).isoformat()
     db.email_sequences.update_one(
         {"_id": ObjectId(sequence_id)},
         {
@@ -217,12 +248,26 @@ def finalize_personalization_run(
                 "personalization_progress.status": status,
                 "personalization_progress.completed": completed,
                 "personalization_progress.failed": failed,
-                "personalization_completed_at": datetime.now(timezone.utc).isoformat(),
+                "personalization_completed_at": now_iso,
                 "personalization_metadata": metadata,
                 "personalization_error": error,
             }
         },
     )
+    # Also mark the matching rewrite_runs entry terminal (if any).
+    if personalization_run_id:
+        db.email_sequences.update_one(
+            {
+                "_id": ObjectId(sequence_id),
+                "rewrite_runs.run_id": personalization_run_id,
+            },
+            {
+                "$set": {
+                    "rewrite_runs.$.status": status,
+                    "rewrite_runs.$.completed_at": now_iso,
+                }
+            },
+        )
     logger.info(
         "Personalization %s for sequence %s: completed=%d failed=%d",
         status, sequence_id, completed, failed,

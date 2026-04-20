@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -46,8 +47,27 @@ def main() -> None:
         "--resume", action="store_true",
         help="Skip recipients already in the S3 checkpoint",
     )
+    parser.add_argument(
+        "--targets", type=str, default=None,
+        help='Targeted rewrite mode. JSON list of {"recipient_id": "...", '
+             '"step": N} objects. When present, the full-batch query is '
+             'skipped and only these (recipient, step) pairs are processed.',
+    )
+    parser.add_argument(
+        "--feedback", type=str, default=None,
+        help="Optional user feedback string injected into the writer prompt "
+             "when running a targeted rewrite. Tells the model what to fix.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    parsed_targets = None
+    if args.targets:
+        try:
+            parsed_targets = json.loads(args.targets)
+        except json.JSONDecodeError as e:
+            print(f"Invalid --targets JSON: {e}", file=sys.stderr)
+            sys.exit(2)
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
@@ -77,6 +97,8 @@ def main() -> None:
         concurrency=args.concurrency,
         max_recipients=args.max_recipients,
         resume=args.resume,
+        targets=parsed_targets,
+        feedback=args.feedback,
     )
 
     try:
@@ -91,6 +113,7 @@ def main() -> None:
                 completed=0, failed=0,
                 metadata={"error_type": type(e).__name__},
                 error=str(e),
+                personalization_run_id=args.personalization_run_id,
             )
         except Exception:
             pass

@@ -17,6 +17,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from bson import ObjectId
+
 from config import (
     HARNESS_BUCKET,
     JUDGE_MODEL,
@@ -128,7 +130,16 @@ def _build_writer_user_prompt(
 
 
 class PersonalizerPipeline:
-    """Per-recipient personalizer for one email_sequence."""
+    """Per-recipient personalizer for one email_sequence.
+
+    Two modes:
+      - Full batch (default): resolve recipients via sequence.tags, iterate all
+        template_emails for each recipient.
+      - Targeted rewrite: when `targets` is passed, skip recipient query and
+        only process the specific (recipient_id, step) pairs. When `feedback`
+        is also passed, inject it into the writer prompt so the model knows
+        what to fix.
+    """
 
     def __init__(
         self,
@@ -138,6 +149,8 @@ class PersonalizerPipeline:
         concurrency: int = 5,
         max_recipients: int = 0,
         resume: bool = False,
+        targets: Optional[List[Dict[str, Any]]] = None,
+        feedback: Optional[str] = None,
     ):
         self.org_id = org_id
         self.sequence_id = sequence_id
@@ -145,6 +158,8 @@ class PersonalizerPipeline:
         self.concurrency = concurrency
         self.max_recipients = max_recipients
         self.resume = resume
+        self.targets = targets
+        self.feedback = feedback
 
         self.cost = CostAccumulator()
         self.system_prompt = _load_system_prompt()
@@ -155,6 +170,8 @@ class PersonalizerPipeline:
         self.recipients: List[Dict[str, Any]] = []
         self.completed_ids: Set[str] = set()
         self.failed_ids: Set[str] = set()
+        # In targeted mode, maps recipient_id -> set of steps to run.
+        self._target_steps_by_rid: Dict[str, Set[int]] = {}
 
     def run(self) -> Dict[str, Any]:
         """Execute the personalization run. Returns final metadata."""
@@ -170,23 +187,44 @@ class PersonalizerPipeline:
             self.sequence_doc.get("name"), len(self.template_emails),
         )
 
-        # 2. Query recipients matching the sequence's targeting
-        tags = self.sequence_doc.get("tags", [])
-        exclude_tags = self.sequence_doc.get("exclude_tags", [])
-        operation = self.sequence_doc.get("tag_operation", "and")
-        self.recipients = query_recipients(
-            organization_id=self.org_id,
-            tags=tags,
-            exclude_tags=exclude_tags,
-            operation=operation,
-            max_recipients=self.max_recipients,
-        )
-        if not self.recipients:
-            raise ValueError(f"No recipients match sequence {self.sequence_id} targeting")
-        logger.info(
-            "Matched %d recipients for tags=%s op=%s exclude=%s",
-            len(self.recipients), tags, operation, exclude_tags,
-        )
+        # 2. Resolve recipients. Targeted mode: fetch by ID list. Full mode:
+        #    query by sequence.tags.
+        if self.targets:
+            target_rids = sorted({t["recipient_id"] for t in self.targets})
+            self.recipients = self._fetch_recipients_by_ids(target_rids)
+            if not self.recipients:
+                raise ValueError(
+                    f"Targeted rewrite: no recipients found for ids={target_rids}"
+                )
+            # Per-recipient step filter (used inside _personalize_one_recipient).
+            self._target_steps_by_rid = {}
+            for t in self.targets:
+                rid = t["recipient_id"]
+                step = int(t["step"])
+                self._target_steps_by_rid.setdefault(rid, set()).add(step)
+            logger.info(
+                "Targeted rewrite: %d recipients, %d (recipient,step) pairs, "
+                "feedback=%s",
+                len(self.recipients), len(self.targets),
+                "yes" if self.feedback else "no",
+            )
+        else:
+            tags = self.sequence_doc.get("tags", [])
+            exclude_tags = self.sequence_doc.get("exclude_tags", [])
+            operation = self.sequence_doc.get("tag_operation", "and")
+            self.recipients = query_recipients(
+                organization_id=self.org_id,
+                tags=tags,
+                exclude_tags=exclude_tags,
+                operation=operation,
+                max_recipients=self.max_recipients,
+            )
+            if not self.recipients:
+                raise ValueError(f"No recipients match sequence {self.sequence_id} targeting")
+            logger.info(
+                "Matched %d recipients for tags=%s op=%s exclude=%s",
+                len(self.recipients), tags, operation, exclude_tags,
+            )
 
         # 3. Resume support: skip recipients already completed in a prior attempt
         if self.resume:
@@ -221,6 +259,7 @@ class PersonalizerPipeline:
             completed=len(self.completed_ids),
             failed=len(self.failed_ids),
             metadata=metadata,
+            personalization_run_id=self.personalization_run_id,
         )
         write_checkpoint(
             bucket=S3_BUCKET,
@@ -292,8 +331,13 @@ class PersonalizerPipeline:
         merge_dict = build_merge_dict(recipient)
         any_step_succeeded = False
 
+        # Targeted-rewrite: restrict to the steps in this recipient's target set.
+        target_steps = self._target_steps_by_rid.get(rid) if self.targets else None
+
         for template in self.template_emails:
             step = template.get("step", 1)
+            if target_steps is not None and step not in target_steps:
+                continue
             template_subject = template.get("subject", "")
             template_content = template.get("content", "")
             template_id = str(template.get("_id"))
@@ -385,6 +429,16 @@ class PersonalizerPipeline:
             available_merge_keys=available_merge_keys,
             enable_web_fetch=has_website,
         )
+
+        # Targeted-rewrite: inject user feedback into the writer prompt so the
+        # model knows what to change vs the prior draft.
+        if self.feedback:
+            user_prompt += (
+                f"\n\n---\n\n## User feedback on the previous version\n\n"
+                f"{self.feedback}\n\n"
+                f"The prior draft was sent back with this feedback. Address it "
+                f"directly in your rewrite."
+            )
 
         # Phase 1: Writer
         writer_result, writer_tokens = write_personalized_email(
@@ -488,6 +542,13 @@ class PersonalizerPipeline:
         resolved_subject = resolve_merge_fields(subject, merge_dict)
         resolved_content = resolve_merge_fields(content, merge_dict)
 
+        # Targeted-rewrite: snapshot the existing doc for rewrite_history
+        # before the upsert replaces it. Runs only in targeted mode so the
+        # full-batch path stays unchanged.
+        previous_version = None
+        if self.targets:
+            previous_version = self._snapshot_existing_for_history(rid, step)
+
         # Phase 6: Upsert
         ok = upsert_personalized_email(
             email_sequence_id=self.sequence_id,
@@ -503,5 +564,58 @@ class PersonalizerPipeline:
             advisor_used=advisor_used,
             original_template_id=template_id,
             dimension_scores=final_judgment.get("dimension_scores") if final_judgment else None,
+            previous_version=previous_version,
         )
         return ok
+
+    # ────────────────────────────────────────────────────────────
+    # Targeted-rewrite helpers
+    # ────────────────────────────────────────────────────────────
+
+    def _fetch_recipients_by_ids(
+        self, recipient_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Fetch specific recipient docs from the READ cluster by _id list.
+
+        Mirrors the cluster choice in query_recipients (recipients live on the
+        READ cluster, not PRIMARY, for this deployment).
+        """
+        from utils.mongo import _get_read_db
+        oids: List[ObjectId] = []
+        for rid in recipient_ids:
+            if not rid or len(rid) != 24:
+                continue
+            try:
+                oids.append(ObjectId(rid))
+            except Exception:
+                continue
+        if not oids:
+            return []
+        db = _get_read_db()
+        return list(db.recipients.find({"_id": {"$in": oids}}))
+
+    def _snapshot_existing_for_history(
+        self, rid: str, step: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Snapshot the current personalized_sequence_emails doc so we can
+        push it into rewrite_history[] before the new upsert replaces it.
+
+        Returns None if no existing doc (first write for this pair).
+        """
+        from utils.mongo import _get_primary_db
+        db = _get_primary_db()
+        existing = db.personalized_sequence_emails.find_one({
+            "email_sequence_id": str(self.sequence_id),
+            "recipient_id": str(rid),
+            "step": step,
+        })
+        if not existing:
+            return None
+        return {
+            "personalization_run_id": existing.get("personalization_run_id"),
+            "quality_score": existing.get("quality_score"),
+            "subject": existing.get("subject"),
+            "content": existing.get("content"),
+            "created_at": existing.get("created_at"),
+            "feedback": self.feedback,
+        }
