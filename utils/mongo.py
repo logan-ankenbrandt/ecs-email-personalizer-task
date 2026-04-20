@@ -69,9 +69,17 @@ def query_recipients(
     operation: str = "and",
     max_recipients: int = 0,
 ) -> List[Dict[str, Any]]:
-    """Find recipients matching the targeting query."""
+    """Find recipients matching the targeting query.
+
+    Mirrors cold-api's recipient_service.get_filtered_recipients_count_only:
+    excludes 'Unsubscribed' status so the personalizer works on the same set
+    the cost-estimate endpoint counted.
+    """
     db = _get_primary_db()
-    match: Dict[str, Any] = {"organization_id": organization_id}
+    match: Dict[str, Any] = {
+        "organization_id": organization_id,
+        "status": {"$ne": "Unsubscribed"},
+    }
     if operation == "and":
         match["tags"] = {"$all": tags}
     else:
