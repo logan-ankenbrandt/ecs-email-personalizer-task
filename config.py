@@ -11,14 +11,23 @@ PROMPT_PREFIX = "email-personalizer/prompt"
 
 # Anthropic
 # WRITER_MODEL: drafts the per-recipient copy (Sonnet 4.6 — fast, cheap, good).
-# JUDGE_MODEL: scores the draft against the rewriter rubric (Opus 4.6 — separate
-# from writer to avoid the same-model self-evaluation bias).
+# JUDGE_MODEL: scores intermediate drafts (Sonnet 4.6 by default — cheaper for
+# the 1st-pass accept/reject call). JUDGE_MODEL_FINAL is used on the final
+# iteration (Opus 4.6). Previously Opus ran every iter (2-3x per step) which
+# made the ~$0.20/recipient estimate explode to $1.07/recipient in live run.
 # REFINE_MODEL: rewrites flagged emails (Sonnet — refinement is mechanical).
 # RESEARCH_MODEL: summarizes the per-recipient web fetch into a company brief.
 WRITER_MODEL = os.environ.get("WRITER_MODEL", "claude-sonnet-4-6")
-JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "claude-opus-4-6")
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "claude-sonnet-4-6")
+JUDGE_MODEL_FINAL = os.environ.get("JUDGE_MODEL_FINAL", "claude-opus-4-6")
 REFINE_MODEL = os.environ.get("REFINE_MODEL", "claude-sonnet-4-6")
 RESEARCH_MODEL = os.environ.get("RESEARCH_MODEL", "claude-haiku-4-5-20251001")
+
+# Writer loop bound. 8 was the rewriter default, but the personalizer writer
+# tends to burn turns on URL-hallucination doom-loops when no company website
+# is on file. 4 caps the damage; Fix 3 (enable_web_fetch gating + circuit
+# breaker) also prevents the hallucination loop from starting.
+WRITER_MAX_TURNS = int(os.environ.get("WRITER_MAX_TURNS", "4"))
 
 API_KEY_PATH = Path.home() / ".config" / "cold" / "auth" / "anthropic_api_key"
 
@@ -42,6 +51,14 @@ MONGO_DB = "administrator"
 QUALITY_THRESHOLD = float(os.environ.get("QUALITY_THRESHOLD", "0.75"))
 QUALITY_HARD_FLOOR = float(os.environ.get("QUALITY_HARD_FLOOR", "0.50"))
 MAX_REFINE_LOOPS = int(os.environ.get("MAX_REFINE_LOOPS", "2"))
+
+# Tiered thresholds: when no company website is available, the writer cannot
+# ground personalization_depth claims (no data to inject) and refines become
+# rephrasing churn that burns cost without raising score. Apply a relaxed
+# threshold + floor in that case. Set these env vars equal to the non-suffixed
+# values to disable the tiering.
+QUALITY_THRESHOLD_NO_RESEARCH = float(os.environ.get("QUALITY_THRESHOLD_NO_RESEARCH", "0.60"))
+QUALITY_HARD_FLOOR_NO_RESEARCH = float(os.environ.get("QUALITY_HARD_FLOOR_NO_RESEARCH", "0.40"))
 
 # Concurrency + batching
 CONCURRENCY_DEFAULT = int(os.environ.get("CONCURRENCY_DEFAULT", "5"))

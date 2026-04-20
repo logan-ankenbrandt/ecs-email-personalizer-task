@@ -82,11 +82,16 @@ def judge_email(
     content: str,
     company_brief: str = "",
     recipient_summary: str = "",
+    model: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Score a draft against the rewriter rubric. Returns (judgment, token_counts).
 
     judgment dict keys: overall_score, dimension_scores, issues, swap_test_result,
     should_refine. See _JUDGE_SCHEMA.
+
+    Pass `model` to override the default (JUDGE_MODEL from config). Pipeline
+    uses Sonnet for intermediate judging and Opus for the final iteration
+    to cut per-step Opus calls from 2+ to 1.
 
     Falls back to a default failing judgment ({overall_score: 0.0, should_refine: True})
     if the LLM call fails so the caller can decide to refine or skip.
@@ -105,7 +110,7 @@ def judge_email(
         judgment = generate_structured(
             prompt=prompt,
             schema=_JUDGE_SCHEMA,
-            model=JUDGE_MODEL,
+            model=model or JUDGE_MODEL,
         )
         # generate_structured doesn't return token counts directly, so we fake
         # an estimate based on prompt length. TODO: extend generate_structured to

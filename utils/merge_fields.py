@@ -18,6 +18,22 @@ logger = logging.getLogger(__name__)
 # (anything else like website, business_name, etc.).
 _DEFAULT_BLANK = ""
 
+# Graceful fallbacks for the most common merge fields that frequently go
+# missing. Prevents broken subjects like "Before 's next bid cycle, Jonathan"
+# when the writer emits {{company}} but the recipient has no business_name.
+# Defence in depth: Fix 2A tells the writer which keys are available, but
+# models sometimes still emit {{company}} — this is the net beneath them.
+_GRACEFUL_FALLBACKS = {
+    "company": "your company",
+    "company_name": "your company",
+    "business_name": "your company",
+    "trade_vertical": "your market",
+    "location": "your area",
+    "city": "your city",
+    "state": "your area",
+    "industry": "your industry",
+}
+
 
 def _extract_custom_field(recipient: Dict[str, Any], key: str) -> Optional[str]:
     """Look up a key in the recipient's custom_fields array."""
@@ -86,7 +102,7 @@ def resolve_merge_fields(text: str, merge_dict: Dict[str, str]) -> str:
         if key in merge_dict:
             return merge_dict[key]
         unknown_keys.add(key)
-        return _DEFAULT_BLANK
+        return _GRACEFUL_FALLBACKS.get(key, _DEFAULT_BLANK)
 
     # Match {{ anything }} including spaces inside braces
     result = re.sub(r"\{\{([^}]+)\}\}", _sub, text)

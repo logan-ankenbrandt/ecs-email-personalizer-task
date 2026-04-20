@@ -20,11 +20,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from config import (
     HARNESS_BUCKET,
     JUDGE_MODEL,
+    JUDGE_MODEL_FINAL,
     KNOWLEDGE_PREFIX,
     MAX_REFINE_LOOPS,
     PROMPT_PREFIX,
     QUALITY_HARD_FLOOR,
+    QUALITY_HARD_FLOOR_NO_RESEARCH,
     QUALITY_THRESHOLD,
+    QUALITY_THRESHOLD_NO_RESEARCH,
     REFINE_MODEL,
     RESEARCH_MODEL,
     S3_BUCKET,
@@ -67,8 +70,40 @@ def _build_writer_user_prompt(
     recipient_summary: str,
     company_brief: str,
     sequence_name: str,
+    available_merge_keys: Optional[Set[str]] = None,
+    enable_web_fetch: bool = True,
 ) -> str:
     """Build the per-recipient user prompt for the writer LLM."""
+    brief_block = (
+        company_brief
+        if company_brief
+        else (
+            "[no pre-fetched brief and no company website on file. DO NOT attempt "
+            "web_fetch — guessing URLs wastes your turn budget. Write from the "
+            "recipient context above using the recipient's real name/title/location.]"
+        )
+    )
+    fetch_hint = (
+        "You may use web_fetch to research the recipient's website (only if a real "
+        "URL appears in the recipient context). "
+        if enable_web_fetch
+        else "web_fetch is disabled for this recipient (no known website). "
+    )
+    if available_merge_keys:
+        keys_list = ", ".join(f"{{{{{k}}}}}" for k in sorted(available_merge_keys))
+        merge_constraint = (
+            f"\n\n## Merge fields available for this recipient\n\n"
+            f"ONLY these merge fields are populated and safe to use as placeholders:\n"
+            f"{keys_list}\n\n"
+            f"Do NOT use any other merge field. If you need to reference the company, "
+            f"location, or vertical and those keys are not in the list above, write "
+            f"the literal value from your research (or a generic fallback if research "
+            f"is empty). Never output {{{{company}}}}, {{{{trade_vertical}}}}, or any "
+            f"field not listed above — unresolved placeholders produce broken subjects "
+            f"like \"Before 's next bid cycle\"."
+        )
+    else:
+        merge_constraint = ""
     return (
         f"You are personalizing email {step} of a sequence ({sequence_name!r}).\n\n"
         f"## Template (the baseline written for the segment)\n\n"
@@ -76,8 +111,8 @@ def _build_writer_user_prompt(
         f"### Body\n{template_content}\n\n"
         f"---\n\n"
         f"## Recipient context\n\n{recipient_summary}\n\n"
-        f"## Company research (pre-fetched; you may also use web_fetch for more)\n\n"
-        f"{company_brief or '[no pre-fetched brief; use web_fetch on the recipient website if available]'}\n\n"
+        f"## Company research\n\n"
+        f"{brief_block}\n\n"
         f"---\n\n"
         f"## Task\n\n"
         f"Rewrite this email FOR THIS RECIPIENT. Keep the strategic intent of the "
@@ -86,9 +121,9 @@ def _build_writer_user_prompt(
         f"Reference real data points ('673 placements', 'San Antonio DMA', 'plant HR directors'). "
         f"Use the swap test: if your sentence still works for any other company in the same "
         f"segment, rewrite it.\n\n"
-        f"You may use web_fetch to research the recipient's website. You may use advisor "
-        f"sparingly for borderline tonal calls. Submit via submit_personalized_email "
-        f"when done. Keep merge field placeholders like {{{{first_name}}}} UNRESOLVED."
+        f"{fetch_hint}Submit via submit_personalized_email when done. "
+        f"Keep merge field placeholders like {{{{first_name}}}} UNRESOLVED."
+        f"{merge_constraint}"
     )
 
 
@@ -275,6 +310,26 @@ class PersonalizerPipeline:
                     company_brief=company_brief,
                     merge_dict=merge_dict,
                 )
+                # Fix 6: retry-once on transient writer failures (max_turns miss,
+                # transient LLM error). Hard-floor rejections are also retried —
+                # a re-run sometimes produces a better draft — but the cost is
+                # bounded because retry happens at most once per step.
+                if not ok:
+                    logger.info(
+                        "Retrying step %d for recipient %s (first attempt failed)",
+                        step, rid,
+                    )
+                    ok = self._personalize_one_step(
+                        recipient=recipient,
+                        rid=rid,
+                        step=step,
+                        template_subject=template_subject,
+                        template_content=template_content,
+                        template_id=template_id,
+                        recipient_summary=recipient_summary,
+                        company_brief=company_brief,
+                        merge_dict=merge_dict,
+                    )
                 if ok:
                     any_step_succeeded = True
             except Exception as e:
@@ -303,6 +358,23 @@ class PersonalizerPipeline:
         Returns True if the personalized version was successfully written to Mongo.
         """
         sequence_name = self.sequence_doc.get("name", "") if self.sequence_doc else ""
+
+        # Fix 3 (gate web_fetch): only enable when a real company website was
+        # successfully pre-fetched. Without this, the writer burns turns guessing
+        # URLs like pattonstaff.com -> pattonstaffing.com -> pattonstaff.co.
+        has_website = bool(company_brief)
+
+        # Fix 5 (tiered thresholds): when no company data is available, the
+        # writer cannot ground personalization_depth claims. Refining just
+        # rephrases the same generic text. Relax the threshold in that case.
+        effective_threshold = QUALITY_THRESHOLD if has_website else QUALITY_THRESHOLD_NO_RESEARCH
+        effective_floor = QUALITY_HARD_FLOOR if has_website else QUALITY_HARD_FLOOR_NO_RESEARCH
+
+        # Fix 2 (merge-field gaps): tell the writer which merge keys are
+        # actually populated for this recipient so it doesn't emit {{company}}
+        # when business_name is blank.
+        available_merge_keys = set(merge_dict.keys())
+
         user_prompt = _build_writer_user_prompt(
             template_subject=template_subject,
             template_content=template_content,
@@ -310,16 +382,22 @@ class PersonalizerPipeline:
             recipient_summary=recipient_summary,
             company_brief=company_brief,
             sequence_name=sequence_name,
+            available_merge_keys=available_merge_keys,
+            enable_web_fetch=has_website,
         )
 
         # Phase 1: Writer
         writer_result, writer_tokens = write_personalized_email(
             system_prompt=self.system_prompt,
             user_prompt=user_prompt,
+            enable_web_fetch=has_website,
         )
         self.cost.record("writer", WRITER_MODEL, writer_tokens["input_tokens"], writer_tokens["output_tokens"])
         if not writer_result:
-            logger.warning("Writer failed for recipient=%s step=%d", rid, step)
+            logger.warning(
+                "step=%d recipient=%s reason=writer_timeout has_website=%s",
+                step, rid, has_website,
+            )
             return False
 
         subject = writer_result.get("subject", "")
@@ -329,30 +407,48 @@ class PersonalizerPipeline:
         advisor_used = writer_result.get("advisor_used", False)
 
         # Phase 2: Judge + (Phase 3) Refine loop
+        # Fix 4 (judge model routing): use the cheap Sonnet judge for
+        # intermediate iterations; only use the Opus judge on the final call
+        # (after max refines, or as the accept/reject decision).
         final_judgment = None
         for refine_iteration in range(MAX_REFINE_LOOPS + 1):
+            is_final_iter = refine_iteration >= MAX_REFINE_LOOPS
+            judge_model = JUDGE_MODEL_FINAL if is_final_iter else JUDGE_MODEL
             judgment, judge_tokens = judge_email(
                 subject=subject,
                 content=content,
                 company_brief=company_brief,
                 recipient_summary=recipient_summary,
+                model=judge_model,
             )
-            self.cost.record("judge", JUDGE_MODEL, judge_tokens["input_tokens"], judge_tokens["output_tokens"])
+            self.cost.record("judge", judge_model, judge_tokens["input_tokens"], judge_tokens["output_tokens"])
             final_judgment = judgment
             score = judgment.get("overall_score", 0.0)
             should_refine = judgment.get("should_refine", False)
 
-            if score >= QUALITY_THRESHOLD or not should_refine:
+            if score >= effective_threshold or not should_refine:
                 logger.info(
-                    "Recipient=%s step=%d: score=%.2f passes (iter=%d)",
-                    rid, step, score, refine_iteration,
+                    "Recipient=%s step=%d: score=%.2f passes (iter=%d, threshold=%.2f, judge=%s)",
+                    rid, step, score, refine_iteration, effective_threshold, judge_model,
                 )
                 break
 
-            if refine_iteration >= MAX_REFINE_LOOPS:
+            # Fix 5 (skip futile refine): if the only failing dimension is
+            # personalization_depth and we have no data, refining cannot help.
+            if not has_website:
+                dim_scores = judgment.get("dimension_scores", {}) or {}
+                failing_dims = [k for k, v in dim_scores.items() if isinstance(v, (int, float)) and v < 0.6]
+                if failing_dims == ["personalization_depth"]:
+                    logger.info(
+                        "Recipient=%s step=%d: skipping refine — no data for personalization_depth",
+                        rid, step,
+                    )
+                    break
+
+            if is_final_iter:
                 logger.info(
-                    "Recipient=%s step=%d: score=%.2f after %d refines, accepting",
-                    rid, step, score, refine_iteration,
+                    "Recipient=%s step=%d: score=%.2f after %d refines, accepting (threshold=%.2f)",
+                    rid, step, score, refine_iteration, effective_threshold,
                 )
                 break
 
@@ -377,11 +473,10 @@ class PersonalizerPipeline:
         # Hard floor: if final score is unsalvageable, skip this recipient/step.
         # message_scheduler will fall back to the template version.
         final_score = final_judgment.get("overall_score", 0.0) if final_judgment else 0.0
-        if final_score < QUALITY_HARD_FLOOR:
+        if final_score < effective_floor:
             logger.warning(
-                "Recipient=%s step=%d: final score %.2f below hard floor %.2f, "
-                "skipping personalization (template fallback)",
-                rid, step, final_score, QUALITY_HARD_FLOOR,
+                "step=%d recipient=%s reason=below_hard_floor score=%.2f floor=%.2f has_website=%s",
+                step, rid, final_score, effective_floor, has_website,
             )
             return False
 

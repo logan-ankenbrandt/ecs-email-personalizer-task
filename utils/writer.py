@@ -1,10 +1,12 @@
-"""Sonnet writer with web_fetch + Opus advisor tools.
+"""Sonnet writer with optional web_fetch tool.
 
 Multi-turn loop using raw anthropic.messages.create() because the writer
 needs tool-use (the structured `generate_structured` helper used elsewhere
 forces a single tool call with no follow-ups).
 
-Pattern ported from ~/.scripts/agentic-email-rewriter-v2.py.
+Pattern ported from ~/.scripts/agentic-email-rewriter-v2.py. The Opus
+advisor tool was removed (Fix 4) — it doubled the writer-phase cost and
+models don't self-restrain on "use sparingly" guidance.
 """
 
 import json
@@ -13,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from anthropic import Anthropic
 
-from config import WRITER_MODEL, get_api_key
+from config import WRITER_MAX_TURNS, WRITER_MODEL, get_api_key
 from utils.web_fetch import fetch_url_cached, normalize_url
 
 logger = logging.getLogger(__name__)
@@ -33,23 +35,6 @@ _WEB_FETCH_TOOL = {
             "url": {"type": "string", "description": "The URL to fetch"},
         },
         "required": ["url"],
-    },
-}
-
-_ADVISOR_TOOL = {
-    "name": "advisor",
-    "description": (
-        "Ask Opus 4.6 for a second opinion on a borderline tonal/positioning "
-        "decision. Use sparingly — only when stuck on whether copy crosses a "
-        "subjective quality line. Returns Opus's recommendation as text."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string", "description": "Specific question for Opus"},
-            "context": {"type": "string", "description": "Relevant draft excerpt or framing"},
-        },
-        "required": ["question"],
     },
 }
 
@@ -91,31 +76,17 @@ _WRITE_RESULT_TOOL = {
 }
 
 
-def _call_advisor(client: Anthropic, question: str, context: str) -> str:
-    """Opus advisor — separate call. Returns plain text response."""
-    try:
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=800,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"You are a senior copy advisor. Answer this borderline "
-                    f"call concisely (under 150 words).\n\n"
-                    f"Question: {question}\n\nContext: {context}"
-                ),
-            }],
-        )
-        return "".join(b.text for b in response.content if hasattr(b, "text") and b.text)
-    except Exception as e:
-        logger.warning("Advisor call failed: %s", type(e).__name__)
-        return "[Advisor unavailable; use your best judgment.]"
+# Circuit-breaker threshold for consecutive web_fetch failures. Two in a row
+# is the signal to stop guessing URLs (the writer was burning turns on doom
+# loops like pattonstaff.com -> pattonstaffing.com -> pattonstaff.co -> ...).
+MAX_CONSECUTIVE_FETCH_FAILURES = 2
 
 
 def write_personalized_email(
     system_prompt: str,
     user_prompt: str,
-    max_turns: int = 8,
+    max_turns: Optional[int] = None,
+    enable_web_fetch: bool = True,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
     """Run the writer loop. Returns (result_dict, token_counts).
 
@@ -123,12 +94,22 @@ def write_personalized_email(
     advisor_used. None if the writer failed to call submit_personalized_email
     within max_turns.
 
+    When enable_web_fetch is False (no known website on file for the recipient),
+    web_fetch is omitted from the tool list. Forces the writer to ground copy
+    in the provided recipient_summary rather than guessing URLs.
+
     token_counts: {input_tokens, output_tokens} accumulated across all turns.
     """
+    if max_turns is None:
+        max_turns = WRITER_MAX_TURNS
     client = Anthropic(api_key=get_api_key())
     messages: List[Dict[str, Any]] = [{"role": "user", "content": user_prompt}]
-    tools = [_WEB_FETCH_TOOL, _ADVISOR_TOOL, _WRITE_RESULT_TOOL]
+    tools: List[Dict[str, Any]] = [_WRITE_RESULT_TOOL]
+    if enable_web_fetch:
+        tools.insert(0, _WEB_FETCH_TOOL)
+    # advisor_used kept in result shape for backward compat; always False now.
     advisor_used = False
+    consecutive_fetch_failures = 0
     total_input_tokens = 0
     total_output_tokens = 0
 
@@ -189,25 +170,33 @@ def write_personalized_email(
             if tool_name == "web_fetch":
                 url = normalize_url(tool_input.get("url", ""))
                 fetched = fetch_url_cached(url, max_chars=5000)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": fetched or "[fetch failed or empty]",
-                })
-                continue
-
-            if tool_name == "advisor":
-                advisor_used = True
-                response_text = _call_advisor(
-                    client,
-                    tool_input.get("question", ""),
-                    tool_input.get("context", ""),
-                )
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": response_text,
-                })
+                if fetched:
+                    consecutive_fetch_failures = 0
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": fetched,
+                    })
+                else:
+                    consecutive_fetch_failures += 1
+                    if consecutive_fetch_failures >= MAX_CONSECUTIVE_FETCH_FAILURES:
+                        # Circuit breaker: stop the URL-guessing doom loop.
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": (
+                                f"[fetch failed] STOP: You have failed to fetch "
+                                f"{consecutive_fetch_failures} URLs in a row. Do NOT guess "
+                                f"more URLs. Use the provided recipient context and submit "
+                                f"via submit_personalized_email now."
+                            ),
+                        })
+                    else:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": "[fetch failed or empty]",
+                        })
                 continue
 
             # Unknown tool
