@@ -502,5 +502,6 @@ class PersonalizerPipeline:
             slop_warnings=slop_warnings,
             advisor_used=advisor_used,
             original_template_id=template_id,
+            dimension_scores=final_judgment.get("dimension_scores") if final_judgment else None,
         )
         return ok

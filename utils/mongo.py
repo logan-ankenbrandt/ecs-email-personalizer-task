@@ -115,6 +115,7 @@ def upsert_personalized_email(
     slop_warnings: Optional[List[Dict[str, Any]]] = None,
     advisor_used: bool = False,
     original_template_id: Optional[str] = None,
+    dimension_scores: Optional[Dict[str, float]] = None,
 ) -> bool:
     """Upsert a per-recipient personalized email. Idempotent on the unique
     compound index (email_sequence_id, recipient_id, step)."""
@@ -133,6 +134,7 @@ def upsert_personalized_email(
         "data_grounding": data_grounding or [],
         "slop_warnings": slop_warnings or [],
         "advisor_used": advisor_used,
+        "dimension_scores": dimension_scores,
     }
     try:
         result = db.personalized_sequence_emails.update_one(
