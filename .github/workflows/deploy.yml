@@ -1,0 +1,96 @@
+name: Deploy to ECR
+
+
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if it doesn't exist
+        run: |
+          aws ecr describe-repositories --repository-names email-personalizer-task --region ${{ secrets.AWS_REGION }} || \
+          aws ecr create-repository --repository-name email-personalizer-task --region ${{ secrets.AWS_REGION }}
+
+      - name: Build, tag, and push Docker image
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          ECR_REPOSITORY: email-personalizer-task
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+
+      - name: Create ECS cluster if it doesn't exist
+        run: |
+          aws ecs describe-clusters --clusters icp-generator-cluster --region ${{ secrets.AWS_REGION }} | grep "ACTIVE" || \
+          aws ecs create-cluster --cluster-name icp-generator-cluster --region ${{ secrets.AWS_REGION }}
+
+      - name: Create CloudWatch log group if it doesn't exist
+        run: |
+          aws logs describe-log-groups --log-group-name-prefix /ecs/email-personalizer-task --region ${{ secrets.AWS_REGION }} | grep "/ecs/email-personalizer-task" || \
+          aws logs create-log-group --log-group-name /ecs/email-personalizer-task --region ${{ secrets.AWS_REGION }}
+
+      - name: Register ECS task definition
+        run: |
+          cat <<EOF > taskdef.json
+          {
+            "family": "email-personalizer-task",
+            "networkMode": "awsvpc",
+            "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "taskRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [
+              {
+                "name": "email-personalizer-task",
+                "image": "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/email-personalizer-task:latest",
+                "memory": 2048,
+                "cpu": 1024,
+                "essential": true,
+                "environment": [
+                  {
+                    "name": "ANTHROPIC_API_KEY",
+                    "value": "${{ secrets.ANTHROPIC_API_KEY }}"
+                  },
+                  {
+                    "name": "PRIMARY_MONGO_URI",
+                    "value": "${{ secrets.PRIMARY_MONGO_URI }}"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/email-personalizer-task",
+                    "awslogs-region": "${{ secrets.AWS_REGION }}",
+                    "awslogs-stream-prefix": "email-personalizer-task"
+                  }
+                }
+              }
+            ],
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "1024",
+            "memory": "2048"
+          }
+          EOF
+          aws ecs register-task-definition --cli-input-json file://taskdef.json
