@@ -8,7 +8,7 @@ structural_compliance, segment_specificity.
 
 import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import HARNESS_BUCKET, JUDGE_MODEL, KNOWLEDGE_PREFIX
 from utils.llm import generate_structured
@@ -83,11 +83,18 @@ def judge_email(
     company_brief: str = "",
     recipient_summary: str = "",
     model: Optional[str] = None,
+    data_grounding: Optional[List[str]] = None,
+    company_insight: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Score a draft against the rewriter rubric. Returns (judgment, token_counts).
 
     judgment dict keys: overall_score, dimension_scores, issues, swap_test_result,
     should_refine. See _JUDGE_SCHEMA.
+
+    T3.1: when `data_grounding` and `company_insight` (both writer-produced)
+    are passed, the judge is told to VERIFY these self-reported claims against
+    the actual copy. Prevents writers from claiming groundedness they don't
+    have — the judge can flag fabricated-feeling facts.
 
     Pass `model` to override the default (JUDGE_MODEL from config). Pipeline
     uses Sonnet for intermediate judging and Opus for the final iteration
@@ -97,6 +104,26 @@ def judge_email(
     if the LLM call fails so the caller can decide to refine or skip.
     """
     base_prompt = _load_assessment_prompt()
+
+    # T3.1: optional writer self-report section so the judge can verify
+    # rather than score blind.
+    self_report_section = ""
+    if data_grounding or company_insight:
+        lines = ["### Writer's self-reported grounding"]
+        if company_insight:
+            lines.append(f"\nCompany insight (writer-stated): {company_insight}")
+        if data_grounding:
+            lines.append("\nFacts the writer says are grounded in real data:")
+            for i, fact in enumerate(data_grounding, start=1):
+                lines.append(f"  {i}. {fact}")
+        lines.append(
+            "\nVerify these claims against the body. If a fact the writer "
+            "says is grounded does not appear in the copy, or appears in a way "
+            "that still fails the swap test, flag it as an issue with "
+            "slop_type='ungrounded_claim'."
+        )
+        self_report_section = "\n".join(lines) + "\n\n"
+
     prompt = (
         f"{base_prompt}\n\n"
         f"---\n\n"
@@ -104,7 +131,8 @@ def judge_email(
         f"### Subject\n{subject}\n\n"
         f"### Body\n{content}\n\n"
         f"### Company context (used during writing)\n{company_brief or '[no company brief available]'}\n\n"
-        f"### Recipient context\n{recipient_summary or '[no recipient context available]'}"
+        f"### Recipient context\n{recipient_summary or '[no recipient context available]'}\n\n"
+        f"{self_report_section}"
     )
     try:
         judgment = generate_structured(

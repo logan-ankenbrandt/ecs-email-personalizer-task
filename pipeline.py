@@ -59,10 +59,177 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_EVERY_N = 50  # write checkpoint after this many recipients complete
 
+# T1.1: the full ruleset lives in six S3 files that were never loaded.
+# Concatenating them into the system prompt recovers ~10KB of quality rules
+# the LLM was previously making decisions without.
+_RULE_FILES: tuple = (
+    "alignment.md",
+    "formatting.md",
+    "quality.md",
+    "slop.md",
+    "structure.md",
+    "tone.md",
+)
+
+# T1.3: port of rewriter_config_v2.STEP_ROLES. Extended to cover email 1 so
+# the personalizer handles initial opener too (the rewriter only targeted
+# follow-ups 2-4). Gives the writer tactical framing per email position.
+STEP_ROLES: Dict[int, str] = {
+    1: (
+        "Opener (Email 1 of N). Introduce why you're reaching out. Data-grounded "
+        "hook, NOT a compliment. Tier 1 CTA: passive, curiosity-based. No "
+        "meeting ask. Under 125 words preferred."
+    ),
+    2: (
+        "Value Bridge (Email 2 of N). Explain how the system works. Show what "
+        "it looks like in practice for a firm like theirs. Tier 1 CTA: passive, "
+        "curiosity-based. No meeting ask."
+    ),
+    3: (
+        "ROI Proof (Email 3 of N). Show the math. Make the investment feel "
+        "obvious. Tier 2 CTA: explicit ask for a call."
+    ),
+    4: (
+        "Breakup (Email 4 of N). Last touch. Gentle urgency through timing "
+        "truth, not artificial scarcity. Tier 2 CTA: explicit ask."
+    ),
+}
+
+# T1.4: port of rewriter_config_v2.VERTICAL_DETECT. Keyword matches against
+# the template text tell us which vertical the sequence targets so we can
+# inject vertical-specific vocabulary into the writer prompt.
+VERTICAL_DETECT: Dict[str, List[str]] = {
+    "healthcare": [
+        "DONs", "clinical managers", "facility relationships",
+        "credentialing", "SNF", "home health",
+    ],
+    "it_tech": [
+        "VPs of Engineering", "CTOs", "IT directors",
+        "contract technical talent", "developers", "technical hiring",
+    ],
+    "exec_search": [
+        "CEOs, CHROs", "board chairs", "retained search",
+        "search engagements", "executive search",
+    ],
+    "hr_peo": [
+        "business owners and CFOs", "compliance gaps", "payroll pain",
+        "PEO", "hired HR internally",
+    ],
+    "va_offshore": [
+        "remote hiring", "timezones", "quality control",
+        "US business owners", "VA agency",
+    ],
+    "light_industrial": [
+        "operations managers", "warehouse directors", "plant managers",
+        "distribution centers", "light industrial",
+    ],
+    "construction_trades": [
+        "superintendents", "project managers", "EPC",
+        "construction staffing", "skilled trades", "GC", "subcontractor",
+    ],
+}
+
+# Preferred vocabulary per vertical. When a vertical is detected the writer
+# is instructed to use these exact words and avoid the copywriter equivalents.
+VERTICAL_VOCAB: Dict[str, List[str]] = {
+    "light_industrial": [
+        "placements (not sales)", "desk (not portfolio)",
+        "hiring managers (not prospects)", "referral network (not inbound pipeline)",
+        "clients (not accounts)", "ops managers", "plant HR",
+    ],
+    "healthcare": [
+        "DONs (not Directors)", "credentialing (not onboarding)",
+        "facility (not client)", "shifts (not jobs)",
+    ],
+    "it_tech": [
+        "contract-to-hire (not temp)", "req (not opening)",
+        "hiring managers (not prospects)", "bench (not pool)",
+    ],
+    "exec_search": [
+        "retained search (not recruiting)", "engagement (not project)",
+        "search (not hire)", "CEO/CHRO (not leadership)",
+    ],
+    "hr_peo": [
+        "compliance gap (not risk)", "payroll (not processing)",
+        "book of business (not portfolio)",
+    ],
+    "va_offshore": [
+        "virtual assistant (not remote worker)",
+        "timezone overlap (not coverage)", "managed VA (not outsourced)",
+    ],
+    "construction_trades": [
+        "superintendent (not supervisor)", "craftsmen (not workers)",
+        "project (not job)", "GC (not client)", "subcontractor (not vendor)",
+    ],
+}
+
+
+def detect_vertical(template_text: str) -> Optional[str]:
+    """Match the template body against VERTICAL_DETECT keyword lists.
+
+    Returns the first vertical whose keywords appear in the template, or
+    None if nothing matches. Case-insensitive.
+    """
+    if not template_text:
+        return None
+    lower = template_text.lower()
+    for vertical, keywords in VERTICAL_DETECT.items():
+        for kw in keywords:
+            if kw.lower() in lower:
+                return vertical
+    return None
+
 
 def _load_system_prompt() -> str:
-    """Load the rewriter harness system prompt from S3."""
-    return load_knowledge(HARNESS_BUCKET, f"{PROMPT_PREFIX}/system.md")
+    """Load the rewriter harness system prompt from S3.
+
+    T1.1: Concatenates the base system.md with every rule file under
+    prompt/rules/ so the LLM sees the full ruleset, not the abbreviated
+    summary. The rule files aren't inlined at build time because the
+    personalizer loads from S3 at runtime; fetch + join per cold start.
+    """
+    base = load_knowledge(HARNESS_BUCKET, f"{PROMPT_PREFIX}/system.md")
+    rule_sections: List[str] = []
+    for fn in _RULE_FILES:
+        try:
+            body = load_knowledge(HARNESS_BUCKET, f"{PROMPT_PREFIX}/rules/{fn}")
+            if body and body.strip():
+                rule_sections.append(f"# Rule: {fn[:-3]}\n\n{body.strip()}")
+        except Exception as e:
+            # Missing rule file is non-fatal — log and fall through with what
+            # we have. Prevents a harness config drift from crashing runs.
+            logger.warning("Skipped rule file %s: %s", fn, type(e).__name__)
+    if not rule_sections:
+        return base
+    return base.rstrip() + "\n\n---\n\n" + "\n\n---\n\n".join(rule_sections)
+
+
+# T1.2: the gold-standard Cash/FirstOption email annotated by the harness.
+# Writer reads it once per cold start as a 0.92 calibration anchor. ~800
+# tokens per writer call; cost is trivial against the quality uplift.
+_quality_example_cache: Optional[str] = None
+
+
+def _load_quality_example() -> str:
+    """Fetch knowledge/quality/examples/high-quality.md once per pipeline.
+
+    Cached at module level so all recipients share the same fetch. Empty
+    string if the file is missing (downgraded silently — the rest of the
+    prompt still works, just without the calibration anchor).
+    """
+    global _quality_example_cache
+    if _quality_example_cache is not None:
+        return _quality_example_cache
+    try:
+        body = load_knowledge(
+            HARNESS_BUCKET,
+            f"{KNOWLEDGE_PREFIX}/quality/examples/high-quality.md",
+        )
+        _quality_example_cache = body or ""
+    except Exception as e:
+        logger.warning("Could not load quality example: %s", type(e).__name__)
+        _quality_example_cache = ""
+    return _quality_example_cache
 
 
 def _build_writer_user_prompt(
@@ -77,6 +244,8 @@ def _build_writer_user_prompt(
     previous_subject: Optional[str] = None,
     previous_content: Optional[str] = None,
     previous_score: Optional[float] = None,
+    vertical: Optional[str] = None,
+    quality_example: Optional[str] = None,
 ) -> str:
     """Build the per-recipient user prompt for the writer LLM.
 
@@ -84,6 +253,11 @@ def _build_writer_user_prompt(
     writer sees the current live personalized version and is instructed to
     improve it rather than regenerate from scratch. This makes rewrites
     monotonically iterate instead of being independent draws.
+
+    When vertical is passed (T1.4), a vocabulary-guidance section is injected
+    so the writer uses industry-specific words (e.g., "desk" not "portfolio"
+    for staffing). When quality_example is passed (T1.2), the gold-standard
+    reference is prepended as a calibration anchor.
     """
     brief_block = (
         company_brief
@@ -147,8 +321,47 @@ def _build_writer_user_prompt(
             f"company. "
         )
 
+    # T1.3: strategic framing by email position.
+    step_role = STEP_ROLES.get(step)
+    step_role_block = (
+        f"## Strategic role for this email\n\n{step_role}\n\n---\n\n"
+        if step_role
+        else ""
+    )
+
+    # T1.4: vertical vocabulary injection. Only adds weight when detection
+    # actually matched — no vertical = no vocabulary constraint.
+    vocab_block = ""
+    if vertical and vertical in VERTICAL_VOCAB:
+        vocab_lines = "\n".join(f"- {w}" for w in VERTICAL_VOCAB[vertical])
+        vocab_block = (
+            f"## Vertical vocabulary ({vertical})\n\n"
+            f"Use the words on the LEFT, not the copywriter equivalents on the "
+            f"right:\n\n{vocab_lines}\n\n---\n\n"
+        )
+
+    # T1.2: calibration anchor. When a gold-standard example loaded,
+    # prepend it as a reference so the writer sees what 0.92 looks like.
+    calibration_block = ""
+    if quality_example:
+        calibration_block = (
+            f"## Reference: a 0.92-quality email for a similar recipient\n\n"
+            f"{quality_example.strip()}\n\n"
+            f"Use this as a CALIBRATION ANCHOR. Your output should match this "
+            f"quality bar:\n"
+            f"- Every sentence must fail the company swap test.\n"
+            f"- Company research shapes the VALUE PROPOSITION, not just the opener.\n"
+            f"- Name specific mechanisms at this recipient's scale, not generic "
+            f"industry observations.\n"
+            f"- Tiered CTAs by email position (per the strategic role above).\n\n"
+            f"---\n\n"
+        )
+
     return (
         f"You are personalizing email {step} of a sequence ({sequence_name!r}).\n\n"
+        f"{step_role_block}"
+        f"{vocab_block}"
+        f"{calibration_block}"
         f"## Template (the baseline written for the segment)\n\n"
         f"### Subject\n{template_subject}\n\n"
         f"### Body\n{template_content}\n\n"
@@ -522,6 +735,12 @@ class PersonalizerPipeline:
         prev_content = previous_version.get("content") if previous_version else None
         prev_score = previous_version.get("quality_score") if previous_version else None
 
+        # T1.4: detect vertical from the template text so the prompt can
+        # inject matching vocabulary. Falls back to None if no keyword hits.
+        vertical = detect_vertical(template_content or "")
+        # T1.2: load the gold-standard calibration example (cached).
+        quality_example = _load_quality_example()
+
         user_prompt = _build_writer_user_prompt(
             template_subject=template_subject,
             template_content=template_content,
@@ -534,6 +753,8 @@ class PersonalizerPipeline:
             previous_subject=prev_subject,
             previous_content=prev_content,
             previous_score=prev_score if isinstance(prev_score, (int, float)) else None,
+            vertical=vertical,
+            quality_example=quality_example,
         )
 
         # Targeted-rewrite: inject user feedback into the writer prompt so the
@@ -589,26 +810,56 @@ class PersonalizerPipeline:
             iters_done = refine_iteration + 1
             is_final_iter = refine_iteration >= MAX_REFINE_LOOPS
             judge_model = JUDGE_MODEL_FINAL if is_final_iter else JUDGE_MODEL
+            # T3.1: judge verifies writer's self-reported grounding against
+            # the copy. Lets the judge catch ungrounded claims the writer
+            # hallucinated.
             judgment, judge_tokens = judge_email(
                 subject=subject,
                 content=content,
                 company_brief=company_brief,
                 recipient_summary=recipient_summary,
                 model=judge_model,
+                data_grounding=data_grounding or None,
+                company_insight=company_insight or None,
             )
             self.cost.record("judge", judge_model, judge_tokens["input_tokens"], judge_tokens["output_tokens"])
             final_judgment = judgment
             score = judgment.get("overall_score", 0.0)
             should_refine = judgment.get("should_refine", False)
 
-            # A4: track best-so-far across iterations.
-            if score > best_score:
+            # T2.1: programmatic slop gate. Run validator on the current
+            # subject/content BEFORE accepting the judge's verdict. Merge any
+            # violations into the issues list and force should_refine=True
+            # regardless of score. Catches em-dashes, banned phrases, and
+            # structural bounds that the LLM judge misses.
+            slop_violations = validate_email(subject=subject, content=content, position=step)
+            if slop_violations:
+                logger.info(
+                    "Recipient=%s step=%d: slop_gate iter=%d violations=%d types=%s",
+                    rid, step, refine_iteration, len(slop_violations),
+                    sorted({v.pattern_type for v in slop_violations})[:5],
+                )
+                slop_issues = [v.to_judge_issue() for v in slop_violations]
+                judgment_issues = list(judgment.get("issues", []) or [])
+                judgment["issues"] = judgment_issues + slop_issues
+                should_refine = True
+                # Track best score BEFORE we consider the slop-flagged version.
+                # A slop-contaminated draft should not be selected as best even
+                # if its LLM score is high; penalize it out of the running.
+                score_for_best = max(0.0, score - 0.1 * len(slop_violations))
+            else:
+                score_for_best = score
+
+            # A4: track best-so-far across iterations (slop-penalized).
+            if score_for_best > best_score:
                 best_subject = subject
                 best_content = content
-                best_score = score
+                best_score = score_for_best
                 best_judgment = judgment
 
-            if score >= effective_threshold or not should_refine:
+            # Accept only if the score clears the threshold (or judge says stop)
+            # AND slop is clean. slop violations always force another refine.
+            if (score >= effective_threshold or not should_refine) and not slop_violations:
                 logger.info(
                     "Recipient=%s step=%d: score=%.2f passes (iter=%d, threshold=%.2f, judge=%s)",
                     rid, step, score, refine_iteration, effective_threshold, judge_model,
@@ -637,12 +888,18 @@ class PersonalizerPipeline:
             # A5: thread user_feedback into refine so a "don't mention
             # company" constraint isn't silently undone by refine chasing the
             # judge's tone critique.
+            # T3.2: also pass recipient + step + vertical so the refiner can
+            # re-ground claims and enforce CTA tier rules per email position.
             refined, refine_tokens = refine_email(
                 current_subject=subject,
                 current_content=content,
                 issues=judgment.get("issues", []),
                 company_brief=company_brief,
                 user_feedback=self.feedback,
+                recipient_summary=recipient_summary,
+                step=step,
+                step_role=STEP_ROLES.get(step),
+                vertical=vertical,
             )
             self.cost.record("refine", REFINE_MODEL, refine_tokens["input_tokens"], refine_tokens["output_tokens"])
             if refined:

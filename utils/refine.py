@@ -49,6 +49,10 @@ def refine_email(
     issues: List[Dict[str, Any]],
     company_brief: str = "",
     user_feedback: Optional[str] = None,
+    recipient_summary: Optional[str] = None,
+    step: Optional[int] = None,
+    step_role: Optional[str] = None,
+    vertical: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
     """Refine the email using the judge's specific issue feedback.
 
@@ -59,6 +63,12 @@ def refine_email(
     be preserved even if it conflicts with the judge's issues. Without this,
     a user's "don't mention the company" feedback could be silently undone by
     refine chasing the judge's tone critique.
+
+    T3.2: when `recipient_summary`, `step`, `step_role`, or `vertical` are
+    passed, they're rendered at the top of the refinement prompt so the
+    refiner can re-ground claims and enforce CTA tier rules per email
+    position. Without these, the refiner had only the current draft + issues
+    and couldn't regenerate grounded content.
     """
     if not issues:
         # Nothing to refine; return the original.
@@ -95,9 +105,31 @@ def refine_email(
             f"constraint, the constraint takes precedence.\n"
         )
 
+    # T3.2: optional context header so the refiner can re-ground claims and
+    # enforce CTA tier. Before this, refiner flew blind on recipient + step.
+    header_bits: List[str] = []
+    if step is not None:
+        header_bits.append(f"Email position: {step}")
+    if step_role:
+        header_bits.append(f"Strategic role: {step_role}")
+    if vertical:
+        header_bits.append(f"Vertical: {vertical}")
+    context_header = ""
+    if header_bits:
+        context_header = (
+            "## Refinement context\n\n" + "\n".join(header_bits) + "\n\n"
+        )
+    recipient_block = ""
+    if recipient_summary:
+        recipient_block = (
+            f"## Recipient context\n\n{recipient_summary}\n\n"
+        )
+
     prompt = (
         f"{base_prompt}\n\n"
         f"---\n\n"
+        f"{context_header}"
+        f"{recipient_block}"
         f"## Current draft\n\n"
         f"### Subject\n{current_subject}\n\n"
         f"### Body\n{current_content}\n\n"

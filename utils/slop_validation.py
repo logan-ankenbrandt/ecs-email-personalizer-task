@@ -136,6 +136,28 @@ BANNED_ADJECTIVES = [
     "seamless", "synergistic", "transformative", "unparalleled", "unwavering",
 ]
 
+# T2.3: verbatim template phrases that ship as cold-email slop. Substring
+# match. Separate from BANNED_PHRASES because these are full sentences /
+# verbatim CTAs that should trigger their own issue category.
+TEMPLATE_PHRASES = [
+    "here is how it works", "here's how it works",
+    "i'd love to", "i would love to",
+    "curious if this is on your radar",
+    "curious if this matches what you're seeing",
+    "does this resonate",
+    "hope this finds you well",
+    "i wanted to reach out",
+    "are you the right person",
+    "let me know when you're free",
+    "when might be a good time",
+    "worth a quick chat",
+    "let me know if interested",
+]
+
+# Structural bounds (T2.3)
+MAX_WORDS_BODY = 165  # hard upper bound; ~150 is the target
+MAX_CHARS_SUBJECT = 55  # hard upper bound; ~50 is the target
+
 
 # ============================================================
 # Result types
@@ -169,7 +191,67 @@ class Violation(NamedTuple):
             return f"Banned adjective: {self.excerpt}"
         if self.pattern_type == "staccato_repetition":
             return "3+ consecutive short sentences (staccato repetition)"
+        if self.pattern_type == "word_count_too_high":
+            return "Email exceeds 165 words; cut to 150 max"
+        if self.pattern_type == "subject_too_long":
+            return "Subject exceeds 55 chars; 50 cap"
+        if self.pattern_type == "missing_signature":
+            return "Missing 'Logan' in signature"
+        if self.pattern_type == "missing_withcold_link":
+            return "Missing withcold.com link in signature"
+        if self.pattern_type == "template_phrase":
+            return f"Template phrase: {self.excerpt}"
         return self.pattern_type
+
+    def _suggestion(self) -> str:
+        """Fix-oriented guidance a refiner can act on."""
+        if self.pattern_type == "em_dash":
+            return "Replace the em dash with a comma, period, or parentheses."
+        if self.pattern_type == "en_dash":
+            return "Replace the en dash with a comma, period, or parentheses."
+        if self.pattern_type == "tricolon_list":
+            return "Cut the three-item list to two items, or restructure as prose."
+        if self.pattern_type == "staccato_repetition":
+            return "Combine short sentences into a flowing sentence with subordinate clauses."
+        if self.pattern_type == "transition_opener":
+            return "Start the sentence with the actual content, not a transition word."
+        if self.pattern_type == "hedging":
+            return "State the claim directly without hedging."
+        if self.pattern_type == "permission_seeking":
+            return "Replace with a direct statement or question."
+        if self.pattern_type.startswith("template_cta"):
+            return "Replace with a CTA that references specific content from THIS email."
+        if self.pattern_type.startswith("template_compliment"):
+            return "Replace with a data-grounded observation about the recipient."
+        if self.pattern_type.startswith("forced_negation"):
+            return "State the positive claim as its own sentence, no 'not X, but Y' contrast."
+        if self.pattern_type == "banned_phrase":
+            return f"Remove the banned phrase '{self.excerpt.strip()}' entirely."
+        if self.pattern_type == "banned_adjective":
+            return "Replace the adjective with a concrete noun or verb, or cut it."
+        if self.pattern_type == "word_count_too_high":
+            return "Cut to under 150 words. Drop a paragraph, not individual words."
+        if self.pattern_type == "subject_too_long":
+            return "Shorten the subject to under 50 chars. Cut fluff, keep the data point."
+        if self.pattern_type == "missing_signature":
+            return "Add 'Logan' as the sign-off line."
+        if self.pattern_type == "missing_withcold_link":
+            return "Add the 'Cold' hyperlink (text 'Cold', href 'https://withcold.com') after the sign-off."
+        if self.pattern_type == "template_phrase":
+            return f"Replace '{self.excerpt.strip()}' with specific, grounded language."
+        return "Rewrite the flagged excerpt."
+
+    def to_judge_issue(self) -> dict:
+        """Shape-compatible with judge.py's `issues[]` schema so the refine
+        loop can consume programmatic violations alongside the LLM judge's
+        own issues without translation.
+        """
+        return {
+            "excerpt": self.excerpt[:200],
+            "slop_type": self.pattern_type,
+            "issue": self._description(),
+            "suggestion": self._suggestion(),
+        }
 
 
 class ValidationResult(NamedTuple):
@@ -248,6 +330,82 @@ def _check_banned_phrases(text: str, position: int, field: str) -> List[Violatio
     return violations
 
 
+def _check_template_phrases(text: str, position: int, field: str) -> List[Violation]:
+    """T2.3: verbatim template-phrase detection."""
+    text_lower = text.lower()
+    violations: List[Violation] = []
+    for phrase in TEMPLATE_PHRASES:
+        if phrase in text_lower:
+            idx = text_lower.find(phrase)
+            start = max(0, idx - 20)
+            end = min(len(text), idx + len(phrase) + 20)
+            violations.append(Violation(
+                pattern_type="template_phrase",
+                email_position=position,
+                field=field,
+                excerpt=text[start:end],
+                severity="hard_fail",
+            ))
+    return violations
+
+
+def _check_structure(subject: str, content_text: str, position: int) -> List[Violation]:
+    """T2.3: structural checks that aren't pattern-level.
+
+    - body word count ceiling (cut at 165, target 150)
+    - subject character ceiling (cut at 55, target 50)
+    - body must contain 'Logan' in the signature
+    - body must contain a withcold.com link (hyperlink or bare)
+    """
+    violations: List[Violation] = []
+
+    # Subject too long
+    if subject and len(subject) > MAX_CHARS_SUBJECT:
+        violations.append(Violation(
+            pattern_type="subject_too_long",
+            email_position=position,
+            field="subject",
+            excerpt=subject[:80],
+            severity="hard_fail",
+        ))
+
+    if not content_text:
+        return violations
+
+    # Body word count
+    words = content_text.split()
+    if len(words) > MAX_WORDS_BODY:
+        violations.append(Violation(
+            pattern_type="word_count_too_high",
+            email_position=position,
+            field="content",
+            excerpt=f"[{len(words)} words, max {MAX_WORDS_BODY}]",
+            severity="hard_fail",
+        ))
+
+    # Signature: must contain 'Logan' somewhere in the body
+    if "Logan" not in content_text:
+        violations.append(Violation(
+            pattern_type="missing_signature",
+            email_position=position,
+            field="content",
+            excerpt="[signature missing]",
+            severity="hard_fail",
+        ))
+
+    # Signature link: must reference withcold.com
+    if "withcold.com" not in content_text.lower():
+        violations.append(Violation(
+            pattern_type="missing_withcold_link",
+            email_position=position,
+            field="content",
+            excerpt="[withcold.com link missing]",
+            severity="hard_fail",
+        ))
+
+    return violations
+
+
 def _check_banned_adjectives(text: str, position: int, field: str) -> List[Violation]:
     violations = []
     for adj in BANNED_ADJECTIVES:
@@ -274,8 +432,11 @@ def _check_banned_adjectives(text: str, position: int, field: str) -> List[Viola
 def validate_email(subject: str, content: str, position: int) -> List[Violation]:
     """Validate a single email against all slop patterns. Returns flat list."""
     violations = []
+    stripped_content = ""
     for raw, field in [(subject or "", "subject"), (content or "", "content")]:
         text = _strip_html(raw)
+        if field == "content":
+            stripped_content = text
         if not text:
             continue
         # Regex patterns
@@ -298,6 +459,12 @@ def validate_email(subject: str, content: str, position: int) -> List[Violation]
             violations.extend(_check_staccato(text, position, field))
         violations.extend(_check_banned_phrases(text, position, field))
         violations.extend(_check_banned_adjectives(text, position, field))
+        violations.extend(_check_template_phrases(text, position, field))
+
+    # T2.3: structural checks run once per email (need both subject + body).
+    violations.extend(
+        _check_structure(_strip_html(subject or ""), stripped_content, position)
+    )
     return violations
 
 
