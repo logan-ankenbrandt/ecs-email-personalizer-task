@@ -74,8 +74,17 @@ def _build_writer_user_prompt(
     sequence_name: str,
     available_merge_keys: Optional[Set[str]] = None,
     enable_web_fetch: bool = True,
+    previous_subject: Optional[str] = None,
+    previous_content: Optional[str] = None,
+    previous_score: Optional[float] = None,
 ) -> str:
-    """Build the per-recipient user prompt for the writer LLM."""
+    """Build the per-recipient user prompt for the writer LLM.
+
+    When previous_subject / previous_content are passed (rewrite mode), the
+    writer sees the current live personalized version and is instructed to
+    improve it rather than regenerate from scratch. This makes rewrites
+    monotonically iterate instead of being independent draws.
+    """
     brief_block = (
         company_brief
         if company_brief
@@ -106,20 +115,51 @@ def _build_writer_user_prompt(
         )
     else:
         merge_constraint = ""
+
+    # Rewrite mode: writer sees the existing personalized version and is
+    # told to iterate on it. This turns rewrites from "regenerate from
+    # template" into "improve version N to produce N+1" — the difference
+    # between monotonic improvement and random resampling.
+    previous_block = ""
+    task_framing = (
+        f"Rewrite this email FOR THIS RECIPIENT. Keep the strategic intent of the "
+        f"template (this is email {step}; preserve the role it plays in the sequence) "
+        f"but ground every claim in specifics about the recipient's company. "
+    )
+    if previous_subject is not None and previous_content is not None:
+        score_note = (
+            f" The prior version scored {previous_score:.2f}/1.00. Your goal is to "
+            f"keep what earned that score and address the issues that kept it from "
+            f"being higher."
+            if previous_score is not None
+            else ""
+        )
+        previous_block = (
+            f"## Previous personalized version\n\n"
+            f"### Subject\n{previous_subject}\n\n"
+            f"### Body\n{previous_content}\n\n"
+            f"---\n\n"
+        )
+        task_framing = (
+            f"Rewrite the previous personalized version above (NOT the generic "
+            f"template).{score_note} Preserve the parts that work; fix the parts "
+            f"that don't. Keep grounding in specifics about the recipient's "
+            f"company. "
+        )
+
     return (
         f"You are personalizing email {step} of a sequence ({sequence_name!r}).\n\n"
         f"## Template (the baseline written for the segment)\n\n"
         f"### Subject\n{template_subject}\n\n"
         f"### Body\n{template_content}\n\n"
         f"---\n\n"
+        f"{previous_block}"
         f"## Recipient context\n\n{recipient_summary}\n\n"
         f"## Company research\n\n"
         f"{brief_block}\n\n"
         f"---\n\n"
         f"## Task\n\n"
-        f"Rewrite this email FOR THIS RECIPIENT. Keep the strategic intent of the "
-        f"template (this is email {step}; preserve the role it plays in the sequence) "
-        f"but ground every claim in specifics about the recipient's company. "
+        f"{task_framing}"
         f"Reference real data points ('673 placements', 'San Antonio DMA', 'plant HR directors'). "
         f"Use the swap test: if your sentence still works for any other company in the same "
         f"segment, rewrite it.\n\n"
@@ -470,6 +510,18 @@ class PersonalizerPipeline:
         # when business_name is blank.
         available_merge_keys = set(merge_dict.keys())
 
+        # Bug A2: in rewrite mode, fetch the existing personalized doc BEFORE
+        # the writer runs so we can (a) show it to the writer and (b) regression-
+        # guard the upsert (A1). Snapshot capture for rewrite_history[] happens
+        # later but reuses this same record.
+        previous_version = None
+        if self.is_rewrite:
+            previous_version = self._snapshot_existing_for_history(rid, step)
+
+        prev_subject = previous_version.get("subject") if previous_version else None
+        prev_content = previous_version.get("content") if previous_version else None
+        prev_score = previous_version.get("quality_score") if previous_version else None
+
         user_prompt = _build_writer_user_prompt(
             template_subject=template_subject,
             template_content=template_content,
@@ -479,6 +531,9 @@ class PersonalizerPipeline:
             sequence_name=sequence_name,
             available_merge_keys=available_merge_keys,
             enable_web_fetch=has_website,
+            previous_subject=prev_subject,
+            previous_content=prev_content,
+            previous_score=prev_score if isinstance(prev_score, (int, float)) else None,
         )
 
         # Targeted-rewrite: inject user feedback into the writer prompt so the
@@ -488,14 +543,21 @@ class PersonalizerPipeline:
                 f"\n\n---\n\n## User feedback on the previous version\n\n"
                 f"{self.feedback}\n\n"
                 f"The prior draft was sent back with this feedback. Address it "
-                f"directly in your rewrite."
+                f"directly in your rewrite. This feedback is a hard constraint "
+                f"and takes precedence over maintaining the prior score."
             )
+
+        # Bug A3: in rewrite mode, lower writer temperature so the rewrite
+        # iterates carefully instead of randomly resampling. Leave None for
+        # full-batch runs where higher variance helps quality.
+        writer_temperature = 0.3 if self.is_rewrite else None
 
         # Phase 1: Writer
         writer_result, writer_tokens = write_personalized_email(
             system_prompt=self.system_prompt,
             user_prompt=user_prompt,
             enable_web_fetch=has_website,
+            temperature=writer_temperature,
         )
         self.cost.record("writer", WRITER_MODEL, writer_tokens["input_tokens"], writer_tokens["output_tokens"])
         if not writer_result:
@@ -511,12 +573,20 @@ class PersonalizerPipeline:
         data_grounding = writer_result.get("data_grounding", [])
         advisor_used = writer_result.get("advisor_used", False)
 
-        # Phase 2: Judge + (Phase 3) Refine loop
+        # Phase 2/3: Judge + Refine loop with best-so-far tracking (Bug A4).
+        # The old loop kept the LAST iteration's output even if it regressed
+        # from an earlier iteration. Now we snapshot whichever iteration
+        # scored highest and use that as the final answer.
         # Fix 4 (judge model routing): use the cheap Sonnet judge for
-        # intermediate iterations; only use the Opus judge on the final call
-        # (after max refines, or as the accept/reject decision).
+        # intermediate iterations; only use the Opus judge on the final call.
         final_judgment = None
+        best_subject = subject
+        best_content = content
+        best_score = 0.0
+        best_judgment: Optional[Dict[str, Any]] = None
+        iters_done = 0
         for refine_iteration in range(MAX_REFINE_LOOPS + 1):
+            iters_done = refine_iteration + 1
             is_final_iter = refine_iteration >= MAX_REFINE_LOOPS
             judge_model = JUDGE_MODEL_FINAL if is_final_iter else JUDGE_MODEL
             judgment, judge_tokens = judge_email(
@@ -530,6 +600,13 @@ class PersonalizerPipeline:
             final_judgment = judgment
             score = judgment.get("overall_score", 0.0)
             should_refine = judgment.get("should_refine", False)
+
+            # A4: track best-so-far across iterations.
+            if score > best_score:
+                best_subject = subject
+                best_content = content
+                best_score = score
+                best_judgment = judgment
 
             if score >= effective_threshold or not should_refine:
                 logger.info(
@@ -545,7 +622,7 @@ class PersonalizerPipeline:
                 failing_dims = [k for k, v in dim_scores.items() if isinstance(v, (int, float)) and v < 0.6]
                 if failing_dims == ["personalization_depth"]:
                     logger.info(
-                        "Recipient=%s step=%d: skipping refine — no data for personalization_depth",
+                        "Recipient=%s step=%d: skipping refine - no data for personalization_depth",
                         rid, step,
                     )
                     break
@@ -557,12 +634,15 @@ class PersonalizerPipeline:
                 )
                 break
 
-            # Refine
+            # A5: thread user_feedback into refine so a "don't mention
+            # company" constraint isn't silently undone by refine chasing the
+            # judge's tone critique.
             refined, refine_tokens = refine_email(
                 current_subject=subject,
                 current_content=content,
                 issues=judgment.get("issues", []),
                 company_brief=company_brief,
+                user_feedback=self.feedback,
             )
             self.cost.record("refine", REFINE_MODEL, refine_tokens["input_tokens"], refine_tokens["output_tokens"])
             if refined:
@@ -575,15 +655,45 @@ class PersonalizerPipeline:
                 )
                 break
 
+        # A4: use the best-seen iteration, not whatever the last one produced.
+        final_judgment = best_judgment or final_judgment
+        subject = best_subject
+        content = best_content
+        final_score = best_score if best_judgment else (
+            final_judgment.get("overall_score", 0.0) if final_judgment else 0.0
+        )
+
         # Hard floor: if final score is unsalvageable, skip this recipient/step.
         # message_scheduler will fall back to the template version.
-        final_score = final_judgment.get("overall_score", 0.0) if final_judgment else 0.0
         if final_score < effective_floor:
             logger.warning(
-                "step=%d recipient=%s reason=below_hard_floor score=%.2f floor=%.2f has_website=%s",
+                "step=%d recipient=%s decision=below_hard_floor score=%.2f "
+                "floor=%.2f has_website=%s iters=%d had_feedback=%s",
                 step, rid, final_score, effective_floor, has_website,
+                iters_done, bool(self.feedback),
             )
             return False
+
+        # A1: regression guard. When a rewrite would replace an existing
+        # doc with a LOWER-scoring version, keep the old one unless the user
+        # provided explicit feedback (which means they asked for a change
+        # that might trade score for the constraint they want honored).
+        if (
+            self.is_rewrite
+            and previous_version is not None
+            and not self.feedback
+            and isinstance(prev_score, (int, float))
+            and (prev_score - final_score) > 0.05
+        ):
+            logger.warning(
+                "step=%d recipient=%s decision=rejected_regression "
+                "old_score=%.2f new_score=%.2f delta=%.2f iters=%d",
+                step, rid, prev_score, final_score, prev_score - final_score,
+                iters_done,
+            )
+            # Return True because we "succeeded" in the sense that the user's
+            # existing copy is preserved. No upsert needed.
+            return True
 
         # Phase 4: Programmatic slop validation
         slop_violations = validate_email(subject=subject, content=content, position=step)
@@ -596,9 +706,18 @@ class PersonalizerPipeline:
         # Targeted-rewrite: snapshot the existing doc for rewrite_history
         # before the upsert replaces it. Runs only in targeted mode so the
         # full-batch path stays unchanged.
-        previous_version = None
-        if self.targets:
-            previous_version = self._snapshot_existing_for_history(rid, step)
+        # previous_version was already captured earlier in this step (A2).
+        # Reuse it here for rewrite_history[] push instead of re-fetching.
+
+        # A6: structured decision log so post-run audits can filter by outcome.
+        logger.info(
+            "step=%d recipient=%s decision=accepted score=%.2f "
+            "old_score=%s iters=%d had_feedback=%s has_website=%s "
+            "best_of_n_iterations=True",
+            step, rid, final_score,
+            f"{prev_score:.2f}" if isinstance(prev_score, (int, float)) else "none",
+            iters_done, bool(self.feedback), has_website,
+        )
 
         # Phase 6: Upsert
         ok = upsert_personalized_email(

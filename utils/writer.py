@@ -87,6 +87,7 @@ def write_personalized_email(
     user_prompt: str,
     max_turns: Optional[int] = None,
     enable_web_fetch: bool = True,
+    temperature: Optional[float] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
     """Run the writer loop. Returns (result_dict, token_counts).
 
@@ -115,13 +116,16 @@ def write_personalized_email(
 
     for turn in range(max_turns):
         try:
-            response = client.messages.create(
-                model=WRITER_MODEL,
-                max_tokens=4000,
-                system=system_prompt,
-                tools=tools,
-                messages=messages,
-            )
+            create_kwargs: Dict[str, Any] = {
+                "model": WRITER_MODEL,
+                "max_tokens": 4000,
+                "system": system_prompt,
+                "tools": tools,
+                "messages": messages,
+            }
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+            response = client.messages.create(**create_kwargs)
         except Exception as e:
             logger.error("Writer LLM call failed at turn %d: %s", turn, e)
             return None, {"input_tokens": total_input_tokens, "output_tokens": total_output_tokens}

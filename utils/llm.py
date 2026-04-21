@@ -26,6 +26,7 @@ def generate_structured(
     model: str = "claude-sonnet-4-6",
     max_tokens: int = 8192,
     max_retries: int = 5,
+    temperature: float = 0.0,
 ) -> dict:
     """Call Anthropic API with tool-use to get structured JSON output.
 
@@ -39,6 +40,9 @@ def generate_structured(
         model: Anthropic model ID.
         max_tokens: Max output tokens.
         max_retries: Number of retries on transient errors.
+        temperature: Sampling temperature. Defaults to 0.0 so that judges and
+            other structured-output callers score deterministically. Set
+            higher (e.g. 0.2) for refinement where light variation helps.
 
     Returns:
         Parsed dict from the tool call input.
@@ -61,6 +65,7 @@ def generate_structured(
             response = client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
+                temperature=temperature,
                 messages=[{"role": "user", "content": prompt}],
                 tools=[tool],
                 tool_choice={"type": "tool", "name": "submit_output"},

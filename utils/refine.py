@@ -48,11 +48,17 @@ def refine_email(
     current_content: str,
     issues: List[Dict[str, Any]],
     company_brief: str = "",
+    user_feedback: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
     """Refine the email using the judge's specific issue feedback.
 
     Returns (refined_dict, token_counts). refined_dict has subject + content +
     changes_made. None if the refine LLM call failed.
+
+    When `user_feedback` is set, it's appended as a hard constraint that must
+    be preserved even if it conflicts with the judge's issues. Without this,
+    a user's "don't mention the company" feedback could be silently undone by
+    refine chasing the judge's tone critique.
     """
     if not issues:
         # Nothing to refine; return the original.
@@ -78,6 +84,17 @@ def refine_email(
         )
     issues_text = "\n\n".join(issues_text_parts)
 
+    # User-feedback block sits AFTER the issues list so it reads as a
+    # priority constraint. Kept short to avoid diluting the judge issues.
+    user_feedback_block = ""
+    if user_feedback and user_feedback.strip():
+        user_feedback_block = (
+            f"\n## User constraint (MUST preserve across this refinement)\n\n"
+            f"{user_feedback.strip()}\n\n"
+            f"Even if fixing a judge issue would conflict with this "
+            f"constraint, the constraint takes precedence.\n"
+        )
+
     prompt = (
         f"{base_prompt}\n\n"
         f"---\n\n"
@@ -86,19 +103,23 @@ def refine_email(
         f"### Body\n{current_content}\n\n"
         f"### Company context (used during original writing)\n"
         f"{company_brief or '[no company brief]'}\n\n"
-        f"## Issues to fix (rewrite ONLY these — preserve everything else)\n\n"
-        f"{issues_text}\n\n"
-        f"## Instructions\n\n"
+        f"## Issues to fix (rewrite ONLY these; preserve everything else)\n\n"
+        f"{issues_text}\n"
+        f"{user_feedback_block}"
+        f"\n## Instructions\n\n"
         f"Return the refined subject + body. Fix every flagged issue. "
         f"Do not change sentences that weren't flagged. Keep merge field "
         f"placeholders ({{{{first_name}}}}, etc.) UNRESOLVED."
     )
 
     try:
+        # Refine: temp=0.2 so we get light variation when rewording but not
+        # so much variance that the rewrite randomly regresses.
         result = generate_structured(
             prompt=prompt,
             schema=_REFINE_OUTPUT_SCHEMA,
             model=REFINE_MODEL,
+            temperature=0.2,
         )
         est_input = len(prompt) // 4
         est_output = len(result.get("content", "")) // 4 + 200
