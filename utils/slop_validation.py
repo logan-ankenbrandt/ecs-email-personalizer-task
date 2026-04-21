@@ -115,16 +115,50 @@ SLOP_PATTERNS = [
         "Permission-seeking ('I'd love to', 'would love to')",
         "hard_fail",
     ),
+    # C.4: process-mechanics leaks. The writer keeps emitting plumbing
+    # details ("three-track system", automation steps, implementation
+    # timelines) that Cash gold-standard never describes.
+    (
+        "process_leak_tracks",
+        re.compile(r"\b(?:two|three|four)[\s-]tracks?\b", re.IGNORECASE),
+        "Process mechanics leak: don't describe track counts",
+        "hard_fail",
+    ),
+    (
+        "process_leak_automation",
+        re.compile(r"\b(?:picks them up automatically|fires when|activates net-new)\b", re.IGNORECASE),
+        "Process mechanics leak: don't describe automation plumbing",
+        "hard_fail",
+    ),
+    (
+        "process_leak_timeline",
+        re.compile(r"\b(?:ten|seven|five|fourteen)\s+days?\s+to\s+(?:build|launch|stand up)\b", re.IGNORECASE),
+        "Process mechanics leak: don't describe implementation timelines",
+        "hard_fail",
+    ),
+    # C.6: P.S. lines aren't in the Cash gold-standard template and read as
+    # filler. Match P.S. at start-of-text OR after a sentence boundary since
+    # HTML stripping collapses paragraph breaks to spaces before regex runs.
+    (
+        "postscript_line",
+        re.compile(r"(?:^|[.!?]\s+)P\.?\s*S\.?[:.]?\s+", re.IGNORECASE),
+        "P.S. line: not in the gold-standard template",
+        "hard_fail",
+    ),
 ]
 
 # Banned phrases (substring match, case-insensitive)
+# A.2: removed "solutions" from this list. Substring match false-positives on
+# legitimate company names (e.g., "FirstOption Workforce Solutions"). Plain-
+# language "solutions" use is low-signal and the company-name false-positive
+# rate outweighed the true-positive catch.
 BANNED_PHRASES = [
     "synergy", "leverage", "utilize", "facilitate", "holistic",
     "touching base", "circle back", "loop in", "ping you", "cutting-edge",
     "game-changer", "revolutionary", "next-level", "just checking in",
     "wanted to follow up", "hope you're doing well", "pick your brain",
     "low-hanging fruit", "move the needle", "I know you're busy",
-    "reaching out because", "solutions", "offerings", "suite of services",
+    "reaching out because", "offerings", "suite of services",
     "empower", "unlock", "supercharge", "turbocharge",
 ]
 
@@ -139,9 +173,11 @@ BANNED_ADJECTIVES = [
 # T2.3: verbatim template phrases that ship as cold-email slop. Substring
 # match. Separate from BANNED_PHRASES because these are full sentences /
 # verbatim CTAs that should trigger their own issue category.
+# A.3: removed "i'd love to" / "i would love to" — they're already covered
+# by the `permission_seeking` regex at SLOP_PATTERNS, which handles smart
+# quotes. Including them here caused double-flag (0.2 penalty for one phrase).
 TEMPLATE_PHRASES = [
     "here is how it works", "here's how it works",
-    "i'd love to", "i would love to",
     "curious if this is on your radar",
     "curious if this matches what you're seeing",
     "does this resonate",
@@ -154,9 +190,29 @@ TEMPLATE_PHRASES = [
     "let me know if interested",
 ]
 
+# C.3: consultant-voice / invented-terminology phrases. Substring match.
+# These are patterns the copy-forensic audit surfaced that pass the judge
+# but read as MBA-consulting voice, not peer-to-peer. Grow over time as new
+# patterns are observed.
+CONSULTANT_VOICE_PHRASES = [
+    "relationship-reactive",
+    "equity to deploy",
+    "bd leak",
+    "timeline compression",
+    "surface conversations",
+    "surfacing search mandates",
+    "client development ceiling",
+    "capacity constraint",
+]
+
 # Structural bounds (T2.3)
 MAX_WORDS_BODY = 165  # hard upper bound; ~150 is the target
 MAX_CHARS_SUBJECT = 55  # hard upper bound; ~50 is the target
+
+# C.1: sentence-length hard cap. Cash gold standard caps at 22 words.
+# Personalizer routinely emits 35-45 word sentences. Judge never flags this.
+# Single highest-leverage copy defect per copy-forensic audit.
+SENTENCE_WORD_CAP = 25
 
 
 # ============================================================
@@ -201,6 +257,10 @@ class Violation(NamedTuple):
             return "Missing withcold.com link in signature"
         if self.pattern_type == "template_phrase":
             return f"Template phrase: {self.excerpt}"
+        if self.pattern_type == "consultant_voice":
+            return f"Consultant voice / invented terminology: {self.excerpt}"
+        if self.pattern_type == "sentence_too_long":
+            return "Sentence exceeds 25-word cap; Cash gold-standard caps at 22"
         return self.pattern_type
 
     def _suggestion(self) -> str:
@@ -239,6 +299,26 @@ class Violation(NamedTuple):
             return "Add the 'Cold' hyperlink (text 'Cold', href 'https://withcold.com') after the sign-off."
         if self.pattern_type == "template_phrase":
             return f"Replace '{self.excerpt.strip()}' with specific, grounded language."
+        if self.pattern_type == "consultant_voice":
+            return (
+                "Replace the consultant-voice phrase with plain industry language. "
+                "Use the recipient's words (placements, desk, referral network), "
+                "not invented compound terms."
+            )
+        if self.pattern_type == "sentence_too_long":
+            return (
+                "Split this sentence. Cash gold-standard caps at 22 words; hard "
+                "limit is 25. Break into two shorter sentences or cut subordinate "
+                "clauses."
+            )
+        if self.pattern_type.startswith("process_leak"):
+            return (
+                "Remove the process-mechanics description. Reader cares about "
+                "outcomes, not plumbing. State what you do (titles, geography), "
+                "not how the system works internally."
+            )
+        if self.pattern_type == "postscript_line":
+            return "Remove the P.S. line. Not in the gold-standard template."
         return "Rewrite the flagged excerpt."
 
     def to_judge_issue(self) -> dict:
@@ -331,8 +411,13 @@ def _check_banned_phrases(text: str, position: int, field: str) -> List[Violatio
 
 
 def _check_template_phrases(text: str, position: int, field: str) -> List[Violation]:
-    """T2.3: verbatim template-phrase detection."""
-    text_lower = text.lower()
+    """T2.3: verbatim template-phrase detection.
+
+    A.4: normalize smart / typographic apostrophes to ASCII before matching
+    so phrases like "here's how it works" still catch when the LLM outputs
+    U+2019. Match is literal substring, so Unicode drift silently misses.
+    """
+    text_lower = text.lower().replace("\u2019", "'").replace("\u2018", "'")
     violations: List[Violation] = []
     for phrase in TEMPLATE_PHRASES:
         if phrase in text_lower:
@@ -349,13 +434,68 @@ def _check_template_phrases(text: str, position: int, field: str) -> List[Violat
     return violations
 
 
-def _check_structure(subject: str, content_text: str, position: int) -> List[Violation]:
+def _check_consultant_voice(text: str, position: int, field: str) -> List[Violation]:
+    """C.3: consultant-voice / invented-terminology detection.
+
+    Substring match against CONSULTANT_VOICE_PHRASES. Same smart-quote
+    normalization as _check_template_phrases for parity.
+    """
+    text_lower = text.lower().replace("\u2019", "'").replace("\u2018", "'")
+    violations: List[Violation] = []
+    for phrase in CONSULTANT_VOICE_PHRASES:
+        if phrase in text_lower:
+            idx = text_lower.find(phrase)
+            start = max(0, idx - 20)
+            end = min(len(text), idx + len(phrase) + 20)
+            violations.append(Violation(
+                pattern_type="consultant_voice",
+                email_position=position,
+                field=field,
+                excerpt=text[start:end],
+                severity="hard_fail",
+            ))
+    return violations
+
+
+def _check_sentence_length(text: str, position: int) -> List[Violation]:
+    """C.1: flag any body sentence that exceeds SENTENCE_WORD_CAP words.
+
+    Cash gold-standard caps at 22 words. 25-word cap gives a small buffer
+    before a violation fires. Single highest-leverage copy defect per audit.
+    """
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    violations: List[Violation] = []
+    for s in sentences:
+        wc = len(s.split())
+        if wc > SENTENCE_WORD_CAP:
+            violations.append(Violation(
+                pattern_type="sentence_too_long",
+                email_position=position,
+                field="content",
+                excerpt=f"[{wc} words] {s[:180]}",
+                severity="hard_fail",
+            ))
+    return violations
+
+
+def _check_structure(
+    subject: str,
+    content_text: str,
+    position: int,
+    raw_content: str = "",
+) -> List[Violation]:
     """T2.3: structural checks that aren't pattern-level.
 
     - body word count ceiling (cut at 165, target 150)
     - subject character ceiling (cut at 55, target 50)
     - body must contain 'Logan' in the signature
     - body must contain a withcold.com link (hyperlink or bare)
+
+    A.1: the withcold.com check looks at the RAW content (with HTML intact).
+    _strip_html replaces `<a href="https://withcold.com">` with a space, so a
+    stripped-text scan loses the URL even when the link is correctly present
+    in the signature. Pass raw_content (the unstripped body) so href
+    attributes survive.
     """
     violations: List[Violation] = []
 
@@ -393,8 +533,12 @@ def _check_structure(subject: str, content_text: str, position: int) -> List[Vio
             severity="hard_fail",
         ))
 
-    # Signature link: must reference withcold.com
-    if "withcold.com" not in content_text.lower():
+    # Signature link: must reference withcold.com. Check RAW content (if
+    # provided) so href attributes inside <a> tags survive HTML stripping.
+    # Fall back to stripped text for backward compatibility with callers
+    # that didn't pass raw_content.
+    haystack = raw_content if raw_content else content_text
+    if "withcold.com" not in haystack.lower():
         violations.append(Violation(
             pattern_type="missing_withcold_link",
             email_position=position,
@@ -457,13 +601,23 @@ def validate_email(subject: str, content: str, position: int) -> List[Violation]
         # Specialized checks (only on body content; subject is too short)
         if field == "content":
             violations.extend(_check_staccato(text, position, field))
+            # C.1: sentence-length check only meaningful on body.
+            violations.extend(_check_sentence_length(text, position))
         violations.extend(_check_banned_phrases(text, position, field))
         violations.extend(_check_banned_adjectives(text, position, field))
         violations.extend(_check_template_phrases(text, position, field))
+        # C.3: consultant-voice check applies to both subject and body.
+        violations.extend(_check_consultant_voice(text, position, field))
 
     # T2.3: structural checks run once per email (need both subject + body).
+    # A.1: pass raw content so the withcold.com URL survives inside href attrs.
     violations.extend(
-        _check_structure(_strip_html(subject or ""), stripped_content, position)
+        _check_structure(
+            _strip_html(subject or ""),
+            stripped_content,
+            position,
+            raw_content=content or "",
+        )
     )
     return violations
 

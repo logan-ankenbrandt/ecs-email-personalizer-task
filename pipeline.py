@@ -14,6 +14,7 @@ Per-recipient steps are serial (each step builds on the prior step's tone).
 """
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -87,11 +88,18 @@ STEP_ROLES: Dict[int, str] = {
     ),
     3: (
         "ROI Proof (Email 3 of N). Show the math. Make the investment feel "
-        "obvious. Tier 2 CTA: explicit ask for a call."
+        "obvious. Tier 2 CTA: explicit ask for a call. "
+        "HARD RULE: do NOT restate the recipient's company description. If this "
+        "sequence uses the same proof point as an earlier step, swap to a "
+        "different metric or framing."
     ),
     4: (
         "Breakup (Email 4 of N). Last touch. Gentle urgency through timing "
-        "truth, not artificial scarcity. Tier 2 CTA: explicit ask."
+        "truth, not artificial scarcity. Tier 2 CTA: explicit ask. "
+        "HARD RULE: do NOT restate the recipient's company description or "
+        "repeat the diagnosis from earlier emails. Reader has already heard "
+        "it. Pivot to a NEW angle: timing, a different proof point, or a "
+        "fresh data observation."
     ),
 }
 
@@ -180,13 +188,70 @@ def detect_vertical(template_text: str) -> Optional[str]:
     return None
 
 
-def _load_system_prompt() -> str:
+# C.2: regex catalog for extracting reusable "proof point" signals from an
+# accepted email body. The writer was found recycling "4x'd pipeline in 90
+# days" across every step; detecting these signals lets us push an explicit
+# "don't reuse" constraint into later steps' prompts.
+_PROOF_POINT_REGEXES: Tuple[re.Pattern, ...] = (
+    re.compile(r"\b\d+x(?:['']?d)?\b", re.IGNORECASE),       # "4x", "4x'd"
+    re.compile(r"\b\d+%"),                                    # "20%"
+    re.compile(r"\b\d+\s+(?:days|weeks|months)\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+(?:placements|contacts|meetings|hires|searches)\b", re.IGNORECASE),
+)
+
+_HTML_TAG_RE_PIPELINE = re.compile(r"<[^>]+>")
+
+
+def _extract_reuse_signals(accepted_body: str) -> Dict[str, str]:
+    """C.2: pull out opener + proof-point markers from an accepted body.
+
+    Returns dict with keys:
+      - opener: first plain-text sentence of the body (signature line)
+      - proof_points: semicolon-joined matched proof-point excerpts
+
+    These are injected into the next step's writer prompt as explicit "don't
+    recycle" constraints. Sequence-level defect, not per-email.
+    """
+    if not accepted_body:
+        return {}
+    # Strip HTML to reason about plain text. Skipping this caused Round 1's
+    # proof-point detection to miss matches inside <p> tags.
+    plain = _HTML_TAG_RE_PIPELINE.sub(" ", accepted_body)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    if not plain:
+        return {}
+
+    # Opener: first sentence up to first period / exclamation / question.
+    first_sentence_match = re.split(r"(?<=[.!?])\s+", plain, maxsplit=1)
+    opener = first_sentence_match[0] if first_sentence_match else plain[:160]
+    opener = opener[:200]
+
+    # Proof-point signals: collect every match across the regex set. Dedupe
+    # by lowercased match so "4x" and "4X" don't both surface.
+    seen: Set[str] = set()
+    matches: List[str] = []
+    for pattern in _PROOF_POINT_REGEXES:
+        for m in pattern.finditer(plain):
+            val = m.group(0).strip()
+            key = val.lower()
+            if key and key not in seen:
+                seen.add(key)
+                matches.append(val)
+
+    return {"opener": opener, "proof_points": "; ".join(matches[:8])}
+
+
+def _load_system_prompt() -> Tuple[str, int]:
     """Load the rewriter harness system prompt from S3.
 
     T1.1: Concatenates the base system.md with every rule file under
     prompt/rules/ so the LLM sees the full ruleset, not the abbreviated
     summary. The rule files aren't inlined at build time because the
     personalizer loads from S3 at runtime; fetch + join per cold start.
+
+    D.1: returns (prompt, rules_loaded_count) so the pipeline can log
+    prompt-assembly telemetry on init. Round 1 shipped 6 prompt changes
+    but only 1 was verifiable from logs; this closes that gap.
     """
     base = load_knowledge(HARNESS_BUCKET, f"{PROMPT_PREFIX}/system.md")
     rule_sections: List[str] = []
@@ -196,12 +261,13 @@ def _load_system_prompt() -> str:
             if body and body.strip():
                 rule_sections.append(f"# Rule: {fn[:-3]}\n\n{body.strip()}")
         except Exception as e:
-            # Missing rule file is non-fatal — log and fall through with what
+            # Missing rule file is non-fatal: log and fall through with what
             # we have. Prevents a harness config drift from crashing runs.
             logger.warning("Skipped rule file %s: %s", fn, type(e).__name__)
     if not rule_sections:
-        return base
-    return base.rstrip() + "\n\n---\n\n" + "\n\n---\n\n".join(rule_sections)
+        return base, 0
+    combined = base.rstrip() + "\n\n---\n\n" + "\n\n---\n\n".join(rule_sections)
+    return combined, len(rule_sections)
 
 
 # T1.2: the gold-standard Cash/FirstOption email annotated by the harness.
@@ -246,6 +312,7 @@ def _build_writer_user_prompt(
     previous_score: Optional[float] = None,
     vertical: Optional[str] = None,
     quality_example: Optional[str] = None,
+    prior_step_signals: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Build the per-recipient user prompt for the writer LLM.
 
@@ -340,6 +407,28 @@ def _build_writer_user_prompt(
             f"right:\n\n{vocab_lines}\n\n---\n\n"
         )
 
+    # C.2: prior-step reuse constraint. Accepts a list of dicts from earlier
+    # accepted steps ({"step": N, "opener": "...", "proof_points": "..."}),
+    # rendered as an explicit "don't recycle" block so the writer doesn't
+    # re-serve the same opener or proof point at step N+1.
+    prior_steps_block = ""
+    if prior_step_signals:
+        lines: List[str] = ["## Prior steps in this sequence (do NOT recycle)"]
+        for sig in prior_step_signals:
+            s_step = sig.get("step", "?")
+            s_opener = (sig.get("opener") or "").strip()
+            s_proof = (sig.get("proof_points") or "").strip()
+            if s_opener:
+                lines.append(f"- Step {s_step} opener: {s_opener!r}")
+            if s_proof:
+                lines.append(f"- Step {s_step} proof points: {s_proof}")
+        lines.append(
+            "\nFor this step, use a DIFFERENT opener framing and a DIFFERENT "
+            "proof point. If the same metric is relevant, frame it from a new "
+            "angle. Reader has already seen the prior step(s)."
+        )
+        prior_steps_block = "\n".join(lines) + "\n\n---\n\n"
+
     # T1.2: calibration anchor. When a gold-standard example loaded,
     # prepend it as a reference so the writer sees what 0.92 looks like.
     calibration_block = ""
@@ -361,6 +450,7 @@ def _build_writer_user_prompt(
         f"You are personalizing email {step} of a sequence ({sequence_name!r}).\n\n"
         f"{step_role_block}"
         f"{vocab_block}"
+        f"{prior_steps_block}"
         f"{calibration_block}"
         f"## Template (the baseline written for the segment)\n\n"
         f"### Subject\n{template_subject}\n\n"
@@ -419,7 +509,21 @@ class PersonalizerPipeline:
         self.rewrite_recipient_id = rewrite_recipient_id
 
         self.cost = CostAccumulator()
-        self.system_prompt = _load_system_prompt()
+        self.system_prompt, self._rules_loaded_count = _load_system_prompt()
+        # Pre-fetch the quality example here so init-time log line (D.1) can
+        # report its size too. Falls back to empty string silently on failure.
+        self._quality_example = _load_quality_example()
+
+        # D.1: one structured log line capturing prompt-assembly telemetry so
+        # post-deploy verification can confirm that T1.1 + T1.2 are firing
+        # without needing to dump the prompt itself.
+        logger.info(
+            "prompt_assembly system_prompt_chars=%d rule_files_loaded=%d "
+            "quality_example_chars=%d",
+            len(self.system_prompt or ""),
+            self._rules_loaded_count,
+            len(self._quality_example or ""),
+        )
 
         # Will be loaded in run()
         self.sequence_doc: Optional[Dict[str, Any]] = None
@@ -638,6 +742,12 @@ class PersonalizerPipeline:
         # Targeted-rewrite: restrict to the steps in this recipient's target set.
         target_steps = self._target_steps_by_rid.get(rid) if self.targets else None
 
+        # C.2: collect per-step reuse signals (opener + proof-point markers)
+        # from each accepted draft so later steps can be told "don't recycle
+        # this". Local to this recipient — thread-safe even under the outer
+        # recipient-parallel ThreadPoolExecutor.
+        prior_step_signals: List[Dict[str, str]] = []
+
         for template in self.template_emails:
             step = template.get("step", 1)
             if target_steps is not None and step not in target_steps:
@@ -647,7 +757,7 @@ class PersonalizerPipeline:
             template_id = str(template.get("_id"))
 
             try:
-                ok = self._personalize_one_step(
+                ok, signal = self._personalize_one_step(
                     recipient=recipient,
                     rid=rid,
                     step=step,
@@ -657,17 +767,18 @@ class PersonalizerPipeline:
                     recipient_summary=recipient_summary,
                     company_brief=company_brief,
                     merge_dict=merge_dict,
+                    prior_step_signals=prior_step_signals,
                 )
                 # Fix 6: retry-once on transient writer failures (max_turns miss,
-                # transient LLM error). Hard-floor rejections are also retried —
-                # a re-run sometimes produces a better draft — but the cost is
-                # bounded because retry happens at most once per step.
+                # transient LLM error). Hard-floor rejections are also retried:
+                # a re-run sometimes produces a better draft. Cost is bounded
+                # because retry happens at most once per step.
                 if not ok:
                     logger.info(
                         "Retrying step %d for recipient %s (first attempt failed)",
                         step, rid,
                     )
-                    ok = self._personalize_one_step(
+                    ok, signal = self._personalize_one_step(
                         recipient=recipient,
                         rid=rid,
                         step=step,
@@ -677,9 +788,12 @@ class PersonalizerPipeline:
                         recipient_summary=recipient_summary,
                         company_brief=company_brief,
                         merge_dict=merge_dict,
+                        prior_step_signals=prior_step_signals,
                     )
                 if ok:
                     any_step_succeeded = True
+                    if signal:
+                        prior_step_signals.append(signal)
             except Exception as e:
                 logger.error(
                     "Step %d for recipient %s crashed: %s",
@@ -700,10 +814,15 @@ class PersonalizerPipeline:
         recipient_summary: str,
         company_brief: str,
         merge_dict: Dict[str, str],
-    ) -> bool:
+        prior_step_signals: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[bool, Optional[Dict[str, str]]]:
         """Write + judge + refine + validate + resolve + upsert one step.
 
-        Returns True if the personalized version was successfully written to Mongo.
+        Returns (ok, signal). `ok` is True when the personalized doc was
+        written (or intentionally preserved via regression guard). `signal`
+        carries this step's opener + proof-point markers (C.2) so the
+        per-recipient loop can append it to prior_step_signals and feed it
+        to subsequent steps as a "don't recycle" constraint.
         """
         sequence_name = self.sequence_doc.get("name", "") if self.sequence_doc else ""
 
@@ -738,8 +857,8 @@ class PersonalizerPipeline:
         # T1.4: detect vertical from the template text so the prompt can
         # inject matching vocabulary. Falls back to None if no keyword hits.
         vertical = detect_vertical(template_content or "")
-        # T1.2: load the gold-standard calibration example (cached).
-        quality_example = _load_quality_example()
+        # T1.2: pre-fetched calibration example from init (self._quality_example).
+        quality_example = self._quality_example
 
         user_prompt = _build_writer_user_prompt(
             template_subject=template_subject,
@@ -755,6 +874,22 @@ class PersonalizerPipeline:
             previous_score=prev_score if isinstance(prev_score, (int, float)) else None,
             vertical=vertical,
             quality_example=quality_example,
+            prior_step_signals=prior_step_signals,
+        )
+
+        # D.2: structured telemetry on what got assembled into the writer
+        # prompt for this specific step. Lets a log tail confirm T1.3 step
+        # role and T1.4 vertical vocab are actually being injected.
+        logger.info(
+            "writer_prompt recipient=%s step=%d vertical=%s has_step_role=%s "
+            "has_vocab=%s has_calibration=%s has_prior_signals=%d "
+            "user_prompt_chars=%d",
+            rid, step, vertical or "none",
+            bool(STEP_ROLES.get(step)),
+            bool(vertical and VERTICAL_VOCAB.get(vertical)),
+            bool(quality_example),
+            len(prior_step_signals or []),
+            len(user_prompt),
         )
 
         # Targeted-rewrite: inject user feedback into the writer prompt so the
@@ -786,7 +921,7 @@ class PersonalizerPipeline:
                 "step=%d recipient=%s reason=writer_timeout has_website=%s",
                 step, rid, has_website,
             )
-            return False
+            return False, None
 
         subject = writer_result.get("subject", "")
         content = writer_result.get("content", "")
@@ -794,17 +929,35 @@ class PersonalizerPipeline:
         data_grounding = writer_result.get("data_grounding", [])
         advisor_used = writer_result.get("advisor_used", False)
 
+        # B.3: log whether the writer actually emitted a withcold.com link in
+        # raw output. Post-A.1 the validator no longer false-positives on
+        # stripped HTML, so this log reveals whether there's a separate
+        # real-link-missing subcomponent to address in a follow-up.
+        logger.info(
+            "writer.link_check recipient=%s step=%d has_link=%s content_len=%d",
+            rid, step,
+            "withcold.com" in (content or "").lower(),
+            len(content or ""),
+        )
+
         # Phase 2/3: Judge + Refine loop with best-so-far tracking (Bug A4).
         # The old loop kept the LAST iteration's output even if it regressed
         # from an earlier iteration. Now we snapshot whichever iteration
         # scored highest and use that as the final answer.
         # Fix 4 (judge model routing): use the cheap Sonnet judge for
         # intermediate iterations; only use the Opus judge on the final call.
+        # B.2: best-of-N ranked by tuple (judge_score, -slop_count). Primary
+        # key is raw judge quality; slop count is tiebreaker. Old code
+        # multiplied slop count into the score so a single phantom violation
+        # (the withcold HTML-strip bug) could mask a genuinely higher-quality
+        # iteration. A.1 eliminates the phantom, but the ranking logic was
+        # still over-weighting slop mechanics vs judge quality.
         final_judgment = None
         best_subject = subject
         best_content = content
-        best_score = 0.0
         best_judgment: Optional[Dict[str, Any]] = None
+        best_judge_score = 0.0
+        best_slop_count = 10**9  # lower is better; start sentinel-high
         iters_done = 0
         for refine_iteration in range(MAX_REFINE_LOOPS + 1):
             iters_done = refine_iteration + 1
@@ -843,19 +996,28 @@ class PersonalizerPipeline:
                 judgment_issues = list(judgment.get("issues", []) or [])
                 judgment["issues"] = judgment_issues + slop_issues
                 should_refine = True
-                # Track best score BEFORE we consider the slop-flagged version.
-                # A slop-contaminated draft should not be selected as best even
-                # if its LLM score is high; penalize it out of the running.
-                score_for_best = max(0.0, score - 0.1 * len(slop_violations))
-            else:
-                score_for_best = score
 
-            # A4: track best-so-far across iterations (slop-penalized).
-            if score_for_best > best_score:
+            # D.3: per-iteration score trajectory. Lets log-investigator
+            # reconstruct judge vs slop trends without rolling up from
+            # indirect signals.
+            logger.info(
+                "refine_iter recipient=%s step=%d iter=%d judge_score=%.3f "
+                "slop_violations=%d should_refine=%s issues=%d",
+                rid, step, refine_iteration, score, len(slop_violations),
+                should_refine, len(judgment.get("issues", []) or []),
+            )
+
+            # B.2: tuple-key ranking. Primary: higher judge score wins.
+            # Tiebreaker: fewer slop violations wins.
+            slop_count = len(slop_violations)
+            better_judge = score > best_judge_score
+            same_judge_fewer_slop = score == best_judge_score and slop_count < best_slop_count
+            if better_judge or same_judge_fewer_slop:
                 best_subject = subject
                 best_content = content
-                best_score = score_for_best
                 best_judgment = judgment
+                best_judge_score = score
+                best_slop_count = slop_count
 
             # Accept only if the score clears the threshold (or judge says stop)
             # AND slop is clean. slop violations always force another refine.
@@ -890,10 +1052,19 @@ class PersonalizerPipeline:
             # judge's tone critique.
             # T3.2: also pass recipient + step + vertical so the refiner can
             # re-ground claims and enforce CTA tier rules per email position.
+            # D.4: log the refiner's input summary so we can confirm it's
+            # receiving the judge issues + slop issues + recipient context.
+            combined_issues = judgment.get("issues", []) or []
+            logger.info(
+                "refine_call recipient=%s step=%d iter=%d issues_in=%d slop_issues=%d "
+                "has_recipient_ctx=%s has_step_role=%s",
+                rid, step, refine_iteration, len(combined_issues), len(slop_violations),
+                bool(recipient_summary), bool(STEP_ROLES.get(step)),
+            )
             refined, refine_tokens = refine_email(
                 current_subject=subject,
                 current_content=content,
-                issues=judgment.get("issues", []),
+                issues=combined_issues,
                 company_brief=company_brief,
                 user_feedback=self.feedback,
                 recipient_summary=recipient_summary,
@@ -912,12 +1083,14 @@ class PersonalizerPipeline:
                 )
                 break
 
-        # A4: use the best-seen iteration, not whatever the last one produced.
+        # A4/B.2: use the best-seen iteration under the tuple-key ranking.
         final_judgment = best_judgment or final_judgment
         subject = best_subject
         content = best_content
-        final_score = best_score if best_judgment else (
-            final_judgment.get("overall_score", 0.0) if final_judgment else 0.0
+        final_score = (
+            best_judge_score
+            if best_judgment
+            else (final_judgment.get("overall_score", 0.0) if final_judgment else 0.0)
         )
 
         # Hard floor: if final score is unsalvageable, skip this recipient/step.
@@ -929,28 +1102,36 @@ class PersonalizerPipeline:
                 step, rid, final_score, effective_floor, has_website,
                 iters_done, bool(self.feedback),
             )
-            return False
+            return False, None
 
-        # A1: regression guard. When a rewrite would replace an existing
-        # doc with a LOWER-scoring version, keep the old one unless the user
-        # provided explicit feedback (which means they asked for a change
-        # that might trade score for the constraint they want honored).
+        # A1 + B.1: regression guard. When a rewrite would replace an
+        # existing doc with a LOWER-scoring version, keep the old one.
+        # B.1: the old carve-out `and not self.feedback` let feedback-driven
+        # rewrites silently regress quality. Copy-forensic audit found the
+        # refiner regressed V2->V3 on 3/3 Jonathan Smith emails precisely
+        # because had_feedback=True skipped this guard. Feedback should
+        # steer, not unlock quality regression; if the refiner makes the
+        # email worse, best-of-N keeps the prior copy.
         if (
             self.is_rewrite
             and previous_version is not None
-            and not self.feedback
             and isinstance(prev_score, (int, float))
             and (prev_score - final_score) > 0.05
         ):
             logger.warning(
                 "step=%d recipient=%s decision=rejected_regression "
-                "old_score=%.2f new_score=%.2f delta=%.2f iters=%d",
+                "old_score=%.2f new_score=%.2f delta=%.2f iters=%d "
+                "had_feedback=%s",
                 step, rid, prev_score, final_score, prev_score - final_score,
-                iters_done,
+                iters_done, bool(self.feedback),
             )
             # Return True because we "succeeded" in the sense that the user's
-            # existing copy is preserved. No upsert needed.
-            return True
+            # existing copy is preserved. No upsert needed. Emit a signal
+            # built from the PRIOR accepted content so later steps still see
+            # the prior opener / proof points and can avoid recycling.
+            preserved_signal = _extract_reuse_signals(prev_content or "")
+            preserved_signal["step"] = str(step)
+            return True, preserved_signal
 
         # Phase 4: Programmatic slop validation
         slop_violations = validate_email(subject=subject, content=content, position=step)
@@ -994,7 +1175,16 @@ class PersonalizerPipeline:
             previous_version=previous_version,
             last_rewrite_feedback=self.feedback,
         )
-        return ok
+
+        # C.2: extract opener + proof-point markers from the accepted body
+        # so later steps in this recipient's sequence can be told "don't
+        # recycle these". Uses the PRE-merge-field content so the signals
+        # reflect what the writer actually produced.
+        signal: Optional[Dict[str, str]] = None
+        if ok:
+            signal = _extract_reuse_signals(content or "")
+            signal["step"] = str(step)
+        return ok, signal
 
     # ────────────────────────────────────────────────────────────
     # Targeted-rewrite helpers
