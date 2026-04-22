@@ -191,14 +191,23 @@ def call_with_tools_loop(
             # Tier B.4: Anthropic server-side context_management. Clears
             # oldest tool_use/tool_result pairs when input tokens approach
             # 80K. Works alongside our client-side pre_turn_hook compactor
-            # (Tier B.1) as a safety net. If the SDK version doesn't
-            # support this kwarg, Anthropic will reject the request; we
-            # catch that case by stripping the key and retrying.
-            "context_management": {
-                "strategy": "clear_tool_uses_20250919",
-                "config": {
-                    "trigger_input_tokens": 80_000,
-                    "target_input_tokens": 30_000,
+            # (Tier B.1) as a safety net.
+            #
+            # Passed via `extra_body` (SDK's forward-compat escape hatch)
+            # rather than a direct kwarg. Older SDK versions don't know
+            # about `context_management`, so passing it as a direct kwarg
+            # raises TypeError before hitting the API. `extra_body` forwards
+            # unknown keys to the HTTP body verbatim — the API server
+            # either honors them (if the feature is enabled) or ignores
+            # them; if it rejects with 400, the BadRequestError fallback
+            # below strips and retries.
+            "extra_body": {
+                "context_management": {
+                    "strategy": "clear_tool_uses_20250919",
+                    "config": {
+                        "trigger_input_tokens": 80_000,
+                        "target_input_tokens": 30_000,
+                    },
                 },
             },
         }
@@ -207,14 +216,14 @@ def call_with_tools_loop(
 
         try:
             response = _call_with_retry(client, create_kwargs, max_retries)
-        except anthropic.BadRequestError as e:
-            # SDK or API rejects context_management kwarg → retry once
-            # without it so we don't hard-fail on older backends.
-            if "context_management" in str(e):
+        except (anthropic.BadRequestError, TypeError) as e:
+            # SDK or API rejects context_management → retry once without
+            # it so we don't hard-fail on older backends.
+            if "context_management" in str(e) or "extra_body" in str(e):
                 logger.warning(
-                    "context_management kwarg rejected; retrying without: %s", e,
+                    "context_management extra_body rejected; retrying without: %s", e,
                 )
-                create_kwargs.pop("context_management", None)
+                create_kwargs.pop("extra_body", None)
                 response = _call_with_retry(client, create_kwargs, max_retries)
             else:
                 raise
