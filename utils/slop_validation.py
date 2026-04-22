@@ -161,10 +161,21 @@ SLOP_PATTERNS = [
         "Forced negation: 'doesn't X on its own'. Diagnose without negating.",
         "hard_fail",
     ),
+    # Round 4.5: widened from the v4 "most X can't match" pattern to cover
+    # the broader "most [noun phrase] don't/can't/aren't/haven't/won't [verb]"
+    # family. v6 output still emitted "most trades staffing firms don't
+    # have" and "most outbound they receive comes from..." — both are
+    # universality claims that the narrow regex missed.
     (
-        "universality_cant_match",
-        re.compile(r"\bmost\s+\w+(?:\s+\w+)?\s+can[\u2018\u2019']?t\s+match\b", re.IGNORECASE),
-        "Universality claim: 'most Xs can't match'. Drop the market comparison.",
+        "universality_most_negation",
+        re.compile(
+            r"\bmost\s+\w+(?:\s+\w+){0,4}\s+"
+            r"(?:don[\u2018\u2019']?t|can[\u2018\u2019']?t|aren[\u2018\u2019']?t|"
+            r"haven[\u2018\u2019']?t|won[\u2018\u2019']?t|isn[\u2018\u2019']?t|"
+            r"doesn[\u2018\u2019']?t)\b",
+            re.IGNORECASE,
+        ),
+        "Universality claim: 'most X don't/can't/aren't Y'. Drop the market comparison.",
         "hard_fail",
     ),
     (
@@ -207,6 +218,37 @@ SLOP_PATTERNS = [
         "forced_negation_not_generic",
         re.compile(r"\bnot\s+(?:a\s+)?generic\s+\w+", re.IGNORECASE),
         "Forced negation: 'not a generic X'. State what you ARE, not what you're not.",
+        "hard_fail",
+    ),
+    # Round 4.5: "generalist firm/agency/etc" market-comparison fallback
+    # that v6 reached for 3 times across the sequence ("a generalist firm
+    # can't", "than it does for a generalist firm", "generalist staffing
+    # agencies"). The writer uses "generalist" when it wants to position
+    # the recipient against a rival but doesn't have a specific named
+    # competitor. Ban the shortcut.
+    (
+        "generalist_comparison",
+        re.compile(
+            r"\b(?:a|than|like|from|as)\s+generalist\s+"
+            r"(?:firm|firms|staffing|agency|agencies|shop|shops|outfit|outfits|recruiter|recruiters)\b",
+            re.IGNORECASE,
+        ),
+        "Market-comparison shortcut: 'a generalist [firm/agency/...]'. "
+        "Name a specific alternative or drop the contrast.",
+        "hard_fail",
+    ),
+    # Round 4.5: vague "different category/level/tier/class" phrasing that
+    # v6 used in step 3 ("conversation starts at a different level") and
+    # step 4 ("put you in a different category"). These phrases sound
+    # grounded but are consultant-deck abstractions that lack specifics.
+    (
+        "vague_category_comparison",
+        re.compile(
+            r"\b(?:in|at|into|on)\s+a\s+different\s+(?:category|level|tier|class|bucket|league)\b",
+            re.IGNORECASE,
+        ),
+        "Vague comparison: 'in/at a different [category/level/...]'. "
+        "Name the specific trait that's different instead.",
         "hard_fail",
     ),
 ]
@@ -403,6 +445,24 @@ class Violation(NamedTuple):
             return (
                 "Replace 'at a conservative [estimate/average]' with the "
                 "actual number. If no number exists, cut the sentence."
+            )
+        if self.pattern_type == "universality_most_negation":
+            return (
+                "Drop the 'most Xs don't/can't Y' clause. If the recipient's "
+                "advantage is real, it doesn't need ranking against 'most' "
+                "of anything."
+            )
+        if self.pattern_type == "generalist_comparison":
+            return (
+                "Replace 'a generalist firm' with a specific named competitor, "
+                "or drop the comparison entirely. Generalist is the fallback "
+                "when you don't have a real rival to point at."
+            )
+        if self.pattern_type == "vague_category_comparison":
+            return (
+                "Replace 'in a different category' with the specific trait "
+                "that's different. 'Your recruiters have field experience' "
+                "beats 'puts you in a different category.'"
             )
         if self.pattern_type == "banned_phrase":
             return f"Remove the banned phrase '{self.excerpt.strip()}' entirely."
