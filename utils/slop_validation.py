@@ -172,10 +172,10 @@ SLOP_PATTERNS = [
             r"\bmost\s+\w+(?:\s+\w+){0,4}\s+"
             r"(?:don[\u2018\u2019']?t|can[\u2018\u2019']?t|aren[\u2018\u2019']?t|"
             r"haven[\u2018\u2019']?t|won[\u2018\u2019']?t|isn[\u2018\u2019']?t|"
-            r"doesn[\u2018\u2019']?t)\b",
+            r"doesn[\u2018\u2019']?t|never)\b",
             re.IGNORECASE,
         ),
-        "Universality claim: 'most X don't/can't/aren't Y'. Drop the market comparison.",
+        "Universality claim: 'most X don't/can't/never Y'. Drop the market comparison.",
         "hard_fail",
     ),
     (

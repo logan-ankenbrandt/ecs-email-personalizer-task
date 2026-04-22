@@ -39,6 +39,57 @@ _NUMERIC_PROOF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Round 4.6 A: signature set for cross-step proof-point deduplication.
+# Every regex here captures a "signature" we can hash across accepted
+# drafts. If step N's content shares a signature with step M < N,
+# step N's doc gets a `proof_recycled` slop warning.
+#
+# Numeric signatures (normalized so "4x" and "4x'd" match) + narrative
+# signatures (short idiomatic phrases the writer reaches for repeatedly).
+_PROOF_SIGNATURE_REGEXES: List = [
+    # Multipliers: "4x", "4x'd", "10x"
+    (re.compile(r"\b(\d+)x(?:['\u2018\u2019]?d)?\b", re.IGNORECASE),
+     lambda m: f"mult_{m.group(1)}x"),
+    # Time windows with "days": "90 days", "60 days"
+    (re.compile(r"\b(\d+)\s+days\b", re.IGNORECASE),
+     lambda m: f"window_{m.group(1)}d"),
+    # "same team" / "same BD team" / "same sales team"
+    (re.compile(r"\bsame\s+(?:team|BD\s+team|sales\s+team|headcount)\b", re.IGNORECASE),
+     lambda m: "phrase_same_team"),
+    # "no new hires" / "no new BD hires" / "no new headcount"
+    (re.compile(r"\bno\s+new\s+(?:hires|headcount|BD\s+hires|sales\s+hires)\b", re.IGNORECASE),
+     lambda m: "phrase_no_new_hires"),
+    # Delivery / volume stats: "1.7 million emails" or "98.2% delivery"
+    (re.compile(r"\b1\.?7\s*(?:million|m)\s+emails\b", re.IGNORECASE),
+     lambda m: "stat_1_7m_emails"),
+    (re.compile(r"\b98\.2%\b", re.IGNORECASE),
+     lambda m: "stat_98_2_delivery"),
+    # "pipeline in N days" / "pipeline in N months"
+    (re.compile(r"\bpipeline\s+in\s+\d+\s+(?:days|weeks|months)\b", re.IGNORECASE),
+     lambda m: "phrase_pipeline_timeframe"),
+    # MSA clients per quarter / year
+    (re.compile(r"\b\d+\s+(?:new\s+)?MSA\s+(?:clients|relationships)\b", re.IGNORECASE),
+     lambda m: "phrase_msa_count"),
+]
+
+
+def extract_proof_signatures(content: str) -> set:
+    """Return the set of normalized proof signatures found in `content`.
+
+    Used by Round 4.6 A to detect when a later step recycles a proof point
+    already used in an earlier step. Returns a set of short string keys
+    like {'mult_4x', 'window_90d', 'phrase_same_team'}.
+    """
+    if not content:
+        return set()
+    # Strip HTML so we match the visible text only.
+    plain = re.sub(r"<[^>]+>", " ", content)
+    signatures = set()
+    for pattern, normalizer in _PROOF_SIGNATURE_REGEXES:
+        for m in pattern.finditer(plain):
+            signatures.add(normalizer(m))
+    return signatures
+
 
 def _extract_first_sentence(text: str) -> str:
     """First terminated sentence, or first 160 chars if no terminator."""
@@ -142,8 +193,15 @@ class RecipientMemory:
         Empty string if this is the first step to be written this session.
         Fed to dispatch_writer so the writer can avoid repeating the opener
         or proof point already used in an earlier step.
+
+        Round 4.6 A: includes a BANNED PROOF SIGNATURES block listing the
+        normalized signatures already used. v7 recycled "4x pipeline in 90
+        days" across 3 of 4 steps despite the existing prior_summary; the
+        explicit banlist is more emphatic than the soft "proof points"
+        mention below.
         """
         parts: List[str] = []
+        all_signatures: set = set()
         for earlier_step in sorted(self.accepted.keys()):
             if earlier_step >= step:
                 continue
@@ -154,7 +212,45 @@ class RecipientMemory:
             if d.proof_points:
                 lines.append(f"  proof points: {d.proof_points}")
             parts.append("\n".join(lines))
-        return "\n\n".join(parts)
+            # Accumulate normalized signatures from this prior step.
+            all_signatures |= extract_proof_signatures(d.raw_content or "")
+
+        if not parts:
+            return ""
+
+        result = "\n\n".join(parts)
+
+        if all_signatures:
+            # Convert signatures back to human-readable banned phrases.
+            phrase_map = {
+                "mult_4x": '"4x" multiplier (e.g. "4x\'d pipeline")',
+                "mult_3x": '"3x" multiplier',
+                "mult_5x": '"5x" multiplier',
+                "mult_10x": '"10x" multiplier',
+                "window_60d": '"60 days" time window',
+                "window_90d": '"90 days" time window',
+                "window_30d": '"30 days" time window',
+                "phrase_same_team": '"same team" / "same BD team"',
+                "phrase_no_new_hires": '"no new hires" / "no new BD hires"',
+                "stat_1_7m_emails": '"1.7 million emails"',
+                "stat_98_2_delivery": '"98.2% delivery rate"',
+                "phrase_pipeline_timeframe": '"pipeline in N days/weeks/months"',
+                "phrase_msa_count": '"N new MSA clients/relationships"',
+            }
+            banned_phrases = [
+                phrase_map.get(s, s) for s in sorted(all_signatures)
+            ]
+            result += (
+                "\n\n## BANNED PROOF SIGNATURES (hard rule)\n"
+                "These specific stats/phrases were already used in earlier "
+                "steps. Do NOT reuse them in this step. Pick a different "
+                "proof point or different framing:\n- "
+                + "\n- ".join(banned_phrases)
+                + "\n\nIf the only approved proof point you can remember is "
+                "already banned, use the recipient's own numbers (years in "
+                "business, placement count, locations) as your proof instead."
+            )
+        return result
 
     def resolution_for(self, step: int) -> Optional[str]:
         """"accepted" / "skipped:<reason>" / None if neither."""

@@ -240,6 +240,44 @@ def run_for_recipient(
         final_violations = validate_email(resolved_subject, resolved_content, step)
         slop_warnings = [v.to_dict() for v in final_violations]
 
+        # Round 4.6 A: cross-step proof-point recycling detector. Compare
+        # this draft's proof signatures against every earlier accepted
+        # step. Any shared signature (e.g. both steps use "4x" + "90
+        # days") is a recycling defect that reads like template filler
+        # by the time the sequence reader hits step 3. Flag on the LATER
+        # doc so the offending rewrite surfaces in the UI.
+        from agent_v2.memory import extract_proof_signatures
+
+        this_sigs = extract_proof_signatures(draft.get("content", "") or "")
+        if this_sigs and memory.accepted:
+            for earlier_step in sorted(memory.accepted.keys()):
+                if earlier_step >= step:
+                    continue
+                earlier = memory.accepted[earlier_step]
+                earlier_sigs = extract_proof_signatures(earlier.raw_content or "")
+                shared = this_sigs & earlier_sigs
+                if shared:
+                    logger.warning(
+                        "orchestrator proof_recycled recipient=%s step=%d "
+                        "recycled_from=%d shared=%s",
+                        rid, step, earlier_step, sorted(shared),
+                    )
+                    slop_warnings.append({
+                        "pattern_type": "proof_recycled",
+                        "email_position": step,
+                        "field": "content",
+                        "excerpt": (
+                            f"[recycled proof-point signatures {sorted(shared)} "
+                            f"also used in step {earlier_step}]"
+                        ),
+                        "severity": "hard_fail",
+                        "issue": (
+                            f"Proof point(s) {sorted(shared)} already appear "
+                            f"in step {earlier_step}. Reader sees the same "
+                            f"stat twice. Pick a different proof point."
+                        ),
+                    })
+
         template = template_by_step[step]
         try:
             ok = upsert_personalized_email(
