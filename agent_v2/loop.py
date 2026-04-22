@@ -90,16 +90,22 @@ def _call_with_retry(
     client: anthropic.Anthropic,
     create_kwargs: Dict[str, Any],
     max_retries: int,
+    use_beta: bool = False,
 ) -> Any:
     """messages.create() wrapper with jittered exponential backoff.
 
     Pattern copied from utils.llm:90-112 so retry behavior is consistent
     across every LLM call site in the pipeline.
+
+    When `use_beta=True`, routes to `client.beta.messages.create` so that
+    beta features like context editing (`context_management`, `betas=[...]`)
+    are accepted by the SDK.
     """
+    create_fn = client.beta.messages.create if use_beta else client.messages.create
     last_error = None
     for attempt in range(max_retries + 1):
         try:
-            return client.messages.create(**create_kwargs)
+            return create_fn(**create_kwargs)
         except anthropic.RateLimitError as e:
             last_error = e
             if attempt < max_retries:
@@ -188,43 +194,57 @@ def call_with_tools_loop(
             "system": system_prompt,
             "tools": tools,
             "messages": messages,
-            # Tier B.4: Anthropic server-side context_management. Clears
-            # oldest tool_use/tool_result pairs when input tokens approach
-            # 80K. Works alongside our client-side pre_turn_hook compactor
-            # (Tier B.1) as a safety net.
-            #
-            # Passed via `extra_body` (SDK's forward-compat escape hatch)
-            # rather than a direct kwarg. Older SDK versions don't know
-            # about `context_management`, so passing it as a direct kwarg
-            # raises TypeError before hitting the API. `extra_body` forwards
-            # unknown keys to the HTTP body verbatim — the API server
-            # either honors them (if the feature is enabled) or ignores
-            # them; if it rejects with 400, the BadRequestError fallback
-            # below strips and retries.
-            "extra_body": {
-                "context_management": {
-                    "strategy": "clear_tool_uses_20250919",
-                    "config": {
-                        "trigger_input_tokens": 80_000,
-                        "target_input_tokens": 30_000,
-                    },
-                },
-            },
         }
         if temperature is not None:
             create_kwargs["temperature"] = temperature
 
+        # Tier B.4 (corrected): server-side context editing via
+        # `clear_tool_uses_20250919`. Docs:
+        # https://platform.claude.com/docs/en/build-with-claude/context-editing
+        #
+        # Three non-obvious requirements the first implementation missed:
+        #   1. Use `client.beta.messages.create` (not `client.messages.create`).
+        #   2. Pass `betas=["context-management-2025-06-27"]` so the beta
+        #      header gets attached automatically by the SDK.
+        #   3. Shape is `{"edits": [{"type": ...}]}`, not the
+        #      `{"strategy": ..., "config": ...}` I originally invented.
+        #
+        # Triggers clearing at 30K input tokens, preserves the last 3
+        # tool_uses (so the orchestrator still has its recent context),
+        # clears at least 5K tokens per invocation to make cache
+        # invalidation worthwhile. Runs alongside our client-side B.1
+        # compactor; they're complementary (server-side gets fine-grained
+        # control, client-side is a belt if the beta isn't enabled).
+        beta_kwargs = dict(create_kwargs)
+        beta_kwargs["betas"] = ["context-management-2025-06-27"]
+        beta_kwargs["context_management"] = {
+            "edits": [
+                {
+                    "type": "clear_tool_uses_20250919",
+                    "trigger": {"type": "input_tokens", "value": 30_000},
+                    "keep": {"type": "tool_uses", "value": 3},
+                    "clear_at_least": {"type": "input_tokens", "value": 5_000},
+                }
+            ]
+        }
+
         try:
-            response = _call_with_retry(client, create_kwargs, max_retries)
+            response = _call_with_retry(
+                client, beta_kwargs, max_retries, use_beta=True,
+            )
         except (anthropic.BadRequestError, TypeError) as e:
-            # SDK or API rejects context_management → retry once without
-            # it so we don't hard-fail on older backends.
-            if "context_management" in str(e) or "extra_body" in str(e):
+            # Beta not enabled on this account OR SDK too old. Log once
+            # per session and fall back to the non-beta endpoint. The
+            # B.1 pre_turn_hook compactor still keeps context bounded.
+            if "context_management" in str(e) or "betas" in str(e):
                 logger.warning(
-                    "context_management extra_body rejected; retrying without: %s", e,
+                    "context_management beta unavailable; falling back to "
+                    "client-side compaction only. Error: %s",
+                    str(e)[:200],
                 )
-                create_kwargs.pop("extra_body", None)
-                response = _call_with_retry(client, create_kwargs, max_retries)
+                response = _call_with_retry(
+                    client, create_kwargs, max_retries, use_beta=False,
+                )
             else:
                 raise
 
