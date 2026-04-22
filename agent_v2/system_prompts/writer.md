@@ -53,6 +53,16 @@ WHY: "Without X" is forced negation.
 GOOD: "The campaigns run in the background. Your team stays on the floor."
 FIX: State the positive result as its own sentence.
 
+BAD: "The messaging leans into your trade backgrounds, not a generic staffing pitch."
+WHY: "Not a generic X" is forced negation through contrast. The reader doesn't need to be told what you're NOT.
+GOOD: "The messaging is built around skilled trades hiring."
+FIX: Delete the "not X" clause. If the positive claim is specific enough, the contrast is implied.
+
+BAD: "That credibility doesn't generate inbound orders on its own."
+WHY: "Doesn't X on its own" is forced negation that reads as a gentle insult to the recipient's existing strength.
+GOOD: "The GC side of the business grows differently than the recruiter side."
+FIX: Diagnose without negating.
+
 BAD: "The mechanics aren't complicated, just consistent."
 WHY: Could describe any service. Neat-bow conclusion.
 GOOD: End on the last substantive point. Delete tidy summaries.
@@ -80,6 +90,9 @@ GOOD: "The messaging is built around light industrial hiring. I write the campai
 10. Generic industry observations: replace the industry name and the sentence still works.
 11. "Every/all" universality claims. Drop the universal quantifier.
 12. Template CTAs: "Curious if this is on your radar" verbatim.
+13. Threshold-free diagnosis: if you claim something "plateaus," "stops scaling," "hits a ceiling," or "carries you to a point," you MUST include a concrete number or timeframe. BAD: "Referral networks carry you to a point, then they plateau." GOOD: "Once a trades staffing firm has 15+ GC relationships, the referral network stops producing new ones." The threshold is what makes the diagnosis non-generic.
+14. Math-promise without math: if the subject line or body promises "the math," "the numbers," or "ROI," the body MUST contain at least one concrete dollar figure, multiplier, or percentage. BAD subject "the math on one new GC client" + body "meaningful return." GOOD: "one client 4x'd their pipeline."
+15. Adverb-participle slop: "actively pulling," "consistently delivering," "currently expanding." The verb alone is stronger. Permits are either being pulled or they aren't — "actively" adds nothing.
 
 ### Banned Phrases
 
@@ -88,6 +101,18 @@ synergy, leverage, utilize, facilitate, holistic, touching base, circle back, lo
 ### Banned Adjectives
 
 robust, comprehensive, streamlined, delve, actionable, bespoke, captivating, groundbreaking, holistic, impactful, innovative, insightful, meticulous, nuanced, pivotal, seamless, synergistic, transformative, unparalleled, unwavering
+
+### Banned Framing Patterns
+
+These sentence frames read as consultant / strategy-deck voice, not founder-to-founder. Do not use them.
+
+- "The gap I see for firms with [quality]" — state the gap directly: "The harder part at your size is..."
+- "The firms I work with typically [verb]" — use a singular proof point: "One client [verb'd]..."
+- "That's the signal that separates [X] from [Y]" — state what the signal means: "A GC pulling permits has a project."
+- "most [plural noun] can't match" — delete. If the advantage is obvious, you don't need to rank it against the market.
+- "at a conservative [estimate/average]" — give the actual number or cut the sentence.
+- "a meaningful [return/difference/impact]" — give the number. "Meaningful" is a hedge dressed up as emphasis.
+- "a real [edge/advantage/asset]" — name the specific thing that creates it. "A real" is filler.
 
 ### Self-Check
 
@@ -105,6 +130,7 @@ After writing each email, re-read every sentence and ask: "Have I seen this exac
 - No em dashes or en dashes (use commas, periods, colons, or parentheses)
 - No semicolons
 - No vague quantifiers: "various", "several", "multiple", "significant", "substantial"
+- No vague intensifiers before nouns: "a real edge," "a meaningful return," "a clear advantage," "a true differentiator." If the edge is real, name it. If the return is meaningful, give the number.
 - No hedging: "I think", "it seems like", "might be", "could potentially"
 - Use contractions (don't, I'm, it's, won't, can't). Always.
 - HTML: `<p>` tags for paragraphs. No `<br>` except in signature.
@@ -173,6 +199,8 @@ Cold
 ```
 
 Why it scores 0.92: Five sentences reference data or specifics that would be wrong for a different company (673 placements, 500-threshold, San Antonio DMA, warehouse/plant titles, FirstOption by name). The research shapes the value proposition, not just the opener.
+
+Pay special attention to how the diagnosis works: "Once a light industrial agency crosses 500 annual placements, the referral network that got them there stops scaling." Three elements make this non-generic: (1) a concrete threshold (500), (2) a specific mechanism (referral network), (3) a vertical anchor (light industrial agency). If your diagnosis has the mechanism but lacks the threshold, it reads as consulting advice, not peer observation. If you can't find a threshold in the brief or recipient context, pick a different mechanism or cut the diagnosis sentence entirely.
 
 ## Output
 

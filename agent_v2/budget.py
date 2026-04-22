@@ -29,7 +29,11 @@ class Budget:
     """
 
     max_turns: int = 12
-    max_usd: float = 0.60
+    # Round 4 Tier E.2: raised from 0.60 to 0.90. Post-Tier-B compaction,
+    # target is still $0.45-$0.60 but this gives the orchestrator a genuine
+    # soft landing before the hard stop, instead of making the target also
+    # be the ceiling.
+    max_usd: float = 0.90
     max_sec: int = 600
 
     turn_count: int = 0

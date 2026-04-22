@@ -197,6 +197,27 @@ def run_for_recipient(
             and isinstance(prev_score, (int, float))
             and (prev_score - quality_score) > 0.05
         ):
+            # A.3: special case — if the orchestrator is submitting at the
+            # writer-self-validated baseline (0.85) against a higher prior,
+            # the delta isn't a real regression. Nudge the orchestrator
+            # toward calling the critic for a real score instead of
+            # retrying the writer (which produces the same 0.85 default).
+            SELF_VALIDATED_BASELINE = 0.85
+            if abs(quality_score - SELF_VALIDATED_BASELINE) < 0.01:
+                logger.info(
+                    "orchestrator submit_step writer_self_validated_baseline_regression_avoided "
+                    "recipient=%s step=%d prev=%.2f baseline=%.2f — suggesting critic",
+                    rid, step, prev_score, quality_score,
+                )
+                return {
+                    "ok": False,
+                    "reason": (
+                        f"writer-self-validated baseline {quality_score:.2f} is "
+                        f"below prior {prev_score:.2f}. Call dispatch_critic on "
+                        f"this draft_id to get a real score, then retry "
+                        f"submit_step with the critic's overall_score."
+                    ),
+                }
             logger.warning(
                 "orchestrator submit_step REGRESSION_BLOCKED recipient=%s step=%d "
                 "prev=%.2f new=%.2f delta=%.2f",
@@ -283,21 +304,93 @@ def run_for_recipient(
     def tool_handler(name: str, tool_input: Dict[str, Any], tool_use_id: str) -> ToolResult:
         memory.log_decision(name, {"input_keys": sorted(tool_input.keys())})
 
+        # Tier B.3: doom-loop detection. If the same tool + identical input
+        # is about to fire for the 3rd time in a row, intervene with a
+        # tool-specific corrective message so the orchestrator stops burning
+        # budget on pathological retries. Not enforced on small/read-only
+        # tools (they're cheap enough that repeated calls don't hurt).
+        _DOOM_CHECKED = {
+            "dispatch_writer",
+            "dispatch_critic",
+            "dispatch_researcher",
+            "get_recipient_brief",
+        }
+        if name in _DOOM_CHECKED and memory.is_doom_loop(name, tool_input):
+            logger.warning(
+                "orchestrator doom_loop_detected recipient=%s tool=%s "
+                "input_keys=%s — blocking and advising change",
+                rid, name, sorted(tool_input.keys()),
+            )
+            if name == "dispatch_writer":
+                advice = (
+                    "DOOM LOOP: you've dispatched writer with the same input "
+                    "3x. Do NOT retry with identical arguments. Either "
+                    "(1) add specific `constraints` describing what should "
+                    "change, or (2) call dispatch_critic on the existing "
+                    "draft_id to get a real score, or (3) call skip_step "
+                    "with reason='persistent_quality_failure'."
+                )
+            elif name == "dispatch_critic":
+                advice = (
+                    "DOOM LOOP: you've critiqued the same draft_id 3x. Critic "
+                    "is deterministic; identical input returns identical "
+                    "verdict. Call submit_step with the score you already "
+                    "have, or skip_step."
+                )
+            elif name == "dispatch_researcher":
+                advice = (
+                    "DOOM LOOP: researcher already ran. Use get_recipient_brief "
+                    "to fetch the cached result; do not re-dispatch."
+                )
+            else:  # get_recipient_brief
+                advice = (
+                    "DOOM LOOP: you've called get_recipient_brief 3x in a row. "
+                    "The brief is cached after the first call. Move on to "
+                    "dispatch_writer or another step."
+                )
+            return ToolResult(content=advice, is_error=True)
+
+        # Record the call BEFORE dispatch so the next check sees this one
+        # in the ring buffer.
+        if name in _DOOM_CHECKED:
+            memory.record_tool_call(name, tool_input)
+
         if name == "list_recipient_gaps":
             gaps = list_recipient_gaps(
                 recipient_id=rid,
                 sequence_id=str(sequence_id),
                 template_steps=all_template_steps,
             )
-            # Filter gaps against active_steps so the orchestrator only sees
-            # steps it's supposed to work on in this run.
-            filtered = {
-                "done": sorted(s for s in gaps["done"] if s in active_steps),
-                "needs_rewrite": sorted(
-                    s for s in gaps["needs_rewrite"] if s in active_steps
-                ),
-                "missing": sorted(s for s in gaps["missing"] if s in active_steps),
-            }
+            # A.1: in rewrite mode (user explicitly asked for regeneration via
+            # scope=recipient or scope=all), every step in active_steps is
+            # work to do. Previously the orchestrator correctly categorized
+            # high-scoring prior docs as "done" and skipped them, but the
+            # user's intent on a scope=recipient click is "regenerate ALL of
+            # this recipient's emails." Promote done -> needs_rewrite so the
+            # orchestrator treats the full active set as work. Prior scores
+            # are still accessible via the regression guard in _submit_step.
+            if is_rewrite:
+                filtered = {
+                    "done": [],
+                    "needs_rewrite": sorted(active_steps),
+                    "missing": sorted(
+                        s for s in gaps["missing"] if s in active_steps
+                    ),
+                }
+            else:
+                # Initial batch: categorize normally so the orchestrator can
+                # skip already-done steps instead of redoing them.
+                filtered = {
+                    "done": sorted(
+                        s for s in gaps["done"] if s in active_steps
+                    ),
+                    "needs_rewrite": sorted(
+                        s for s in gaps["needs_rewrite"] if s in active_steps
+                    ),
+                    "missing": sorted(
+                        s for s in gaps["missing"] if s in active_steps
+                    ),
+                }
             return ToolResult(content=json.dumps(filtered))
 
         if name == "get_recipient_brief":
@@ -401,6 +494,76 @@ def run_for_recipient(
     # we cap via max_turns here and also let the tool_handler refuse new
     # dispatches when budget is exhausted (future enhancement — today we
     # rely on max_turns and spend tracking after each call).
+    # Tier B.1 compaction + Tier E.1 budget telemetry: combined per-turn
+    # hook. Prunes stale tool_result payloads AND appends a structured
+    # session_status block to the last user message so the orchestrator
+    # can pace itself as budget depletes. Modeled on Claude Code's
+    # taskBudget.remaining surfacing.
+    from agent_v2.memory import compact_messages
+
+    def _pre_turn_hook(msgs: List[Dict[str, Any]]) -> None:
+        # Compact first so downstream token estimates reflect the trimmed
+        # message list.
+        compacted = compact_messages(msgs)
+        if compacted:
+            logger.info(
+                "orchestrator compact_messages recipient=%s compacted=%d",
+                rid, compacted,
+            )
+        # Build session_status and attach to the last user message. Only
+        # fires after the first orchestrator turn (when there's at least
+        # one tool_result user message to attach to).
+        if not msgs:
+            return
+        # Find the last user message — that's the one the model reads
+        # before its next reply.
+        last_user_idx = None
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None:
+            return
+
+        turns_used = budget.turn_count
+        turns_remaining = max(0, budget.max_turns - turns_used)
+        usd_spent = round(budget.cost_usd, 3)
+        usd_remaining = round(max(0.0, budget.max_usd - budget.cost_usd), 3)
+        steps_resolved = sorted(list(memory.accepted.keys()) + list(memory.skipped.keys()))
+        steps_pending = sorted([s for s in active_steps if s not in memory.accepted and s not in memory.skipped])
+        status_parts = [
+            "<session_status>",
+            f"budget_spent_usd: {usd_spent}",
+            f"budget_remaining_usd: {usd_remaining}",
+            f"turns_used: {turns_used}",
+            f"turns_remaining: {turns_remaining}",
+            f"steps_resolved: {steps_resolved}",
+            f"steps_pending: {steps_pending}",
+        ]
+        if usd_remaining < 0.10 or turns_remaining <= 2:
+            status_parts.append(
+                "URGENT: You are near budget exhaustion. For each pending "
+                "step, either submit the best available draft now or call "
+                "skip_step. Do not dispatch new writer or critic calls."
+            )
+        status_parts.append("</session_status>")
+        status_block = "\n".join(status_parts)
+
+        # Append to the last user message's content. Handles both
+        # list-of-blocks and string content shapes.
+        last_user = msgs[last_user_idx]
+        current = last_user.get("content", "")
+        if isinstance(current, list):
+            # Tool-result list: append a text block.
+            new_content = list(current)
+            new_content.append({"type": "text", "text": "\n\n" + status_block})
+            msgs[last_user_idx] = {**last_user, "content": new_content}
+        elif isinstance(current, str):
+            msgs[last_user_idx] = {
+                **last_user,
+                "content": current.rstrip() + "\n\n" + status_block,
+            }
+
     loop_result = call_with_tools_loop(
         system_prompt=orchestrator_prompt,
         messages=messages,
@@ -410,6 +573,7 @@ def run_for_recipient(
         tool_handler=tool_handler,
         max_tokens_per_turn=4096,
         temperature=0.2,
+        pre_turn_hook=_pre_turn_hook,
     )
 
     # Record orchestrator's own cost (the Opus turns).

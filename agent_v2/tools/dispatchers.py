@@ -217,11 +217,29 @@ def handle_dispatch_critic(
     )
     _record_sub_agent_cost(cost_tracker, budget, "critic", JUDGE_MODEL_FINAL, usage)
 
+    # Tier B.2: cap issues list at 5 items + each excerpt at 150 chars.
+    # The critic can produce 10+ issues for a single draft; most are
+    # stylistic nitpicks the orchestrator doesn't need to reason over in
+    # full. Full issues stay in memory if we ever want to surface them.
+    raw_issues = verdict.get("issues", []) or []
+    truncated_issues = []
+    for issue in raw_issues[:5]:
+        if not isinstance(issue, dict):
+            continue
+        truncated_issues.append({
+            "excerpt": (issue.get("excerpt", "") or "")[:150],
+            "slop_type": issue.get("slop_type"),
+            "issue": (issue.get("issue", "") or "")[:200],
+            "suggestion": (issue.get("suggestion", "") or "")[:200],
+        })
+    memory.log_decision("critic_full_issues_count", {"count": len(raw_issues)})
+
     return {
         "ok": True,
         "score": float(verdict.get("overall_score", 0.0)),
         "dim_scores": verdict.get("dimension_scores", {}) or {},
-        "issues": verdict.get("issues", []) or [],
+        "issues": truncated_issues,
+        "issues_total": len(raw_issues),
         "should_refine": bool(verdict.get("should_refine", False)),
         "swap_test_result": verdict.get("swap_test_result", {}),
         "verdict_draft_id": draft_id,  # so orchestrator can pair verdict with draft
@@ -233,6 +251,8 @@ def _summarize_brief(brief: Dict[str, Any]) -> str:
 
     The orchestrator doesn't need the full brief — it's given to writers
     directly. The orchestrator just needs enough to make dispatch decisions.
+    Tier B.2: summary is hard-capped at 400 chars to keep per-turn input
+    costs bounded.
     """
     parts = []
     if brief.get("vertical") and brief["vertical"] != "general":
@@ -246,4 +266,7 @@ def _summarize_brief(brief: Dict[str, Any]) -> str:
     metrics = brief.get("notable_metrics", [])
     if metrics:
         parts.append(f"metrics: {'; '.join(metrics[:3])}")
-    return " | ".join(parts) if parts else "[thin brief, limited data]"
+    out = " | ".join(parts) if parts else "[thin brief, limited data]"
+    # Hard cap: 400 chars keeps the orchestrator's per-turn input lean
+    # even when the researcher produces a rich brief.
+    return out[:400]

@@ -145,6 +145,70 @@ SLOP_PATTERNS = [
         "P.S. line: not in the gold-standard template",
         "hard_fail",
     ),
+    # Round 4 / Tier C.7: 9 new slop patterns identified by line-by-line
+    # audit of the first V2 runs. Each targets a specific slop family the
+    # writer keeps reaching for when it lacks a hard number to anchor its
+    # diagnosis.
+    (
+        "consultant_gap_framing",
+        re.compile(r"\bthe gap I see\b", re.IGNORECASE),
+        "Consultant voice: 'the gap I see' framing. State the gap directly.",
+        "hard_fail",
+    ),
+    (
+        "forced_negation_on_its_own",
+        re.compile(r"\bdoesn[\u2018\u2019']?t\s+\w+(?:\s+\w+){0,5}\s+on its own\b", re.IGNORECASE),
+        "Forced negation: 'doesn't X on its own'. Diagnose without negating.",
+        "hard_fail",
+    ),
+    (
+        "universality_cant_match",
+        re.compile(r"\bmost\s+\w+(?:\s+\w+)?\s+can[\u2018\u2019']?t\s+match\b", re.IGNORECASE),
+        "Universality claim: 'most Xs can't match'. Drop the market comparison.",
+        "hard_fail",
+    ),
+    (
+        "vague_intensifier_real",
+        re.compile(r"\ba\s+real\s+(?:edge|advantage|differentiator|asset|strength)\b", re.IGNORECASE),
+        "Vague intensifier: 'a real [noun]'. Name the specific advantage.",
+        "hard_fail",
+    ),
+    (
+        "vague_intensifier_meaningful",
+        re.compile(
+            r"\b(?:a|that[\u2018\u2019']?s\s+a)\s+meaningful\s+(?:return|difference|impact|advantage|edge)\b",
+            re.IGNORECASE,
+        ),
+        "Vague intensifier: 'a meaningful [noun]'. Give the number instead.",
+        "hard_fail",
+    ),
+    (
+        "consultant_firms_i_work_with",
+        re.compile(r"\bthe\s+(?:firms|companies|agencies)\s+I\s+work\s+with\b", re.IGNORECASE),
+        "Consultant voice: 'the firms I work with'. Use a singular proof point instead.",
+        "hard_fail",
+    ),
+    (
+        "fake_opinion_signal",
+        re.compile(r"\bthat[\u2018\u2019']?s\s+the\s+signal\s+that\s+separates\b", re.IGNORECASE),
+        "Fake-opinion connector: 'that's the signal that separates'. State what the signal means.",
+        "hard_fail",
+    ),
+    (
+        "vague_conservative_estimate",
+        re.compile(
+            r"\bat\s+a\s+conservative\s+(?:estimate|average|valuation|projection)\b",
+            re.IGNORECASE,
+        ),
+        "Vague quantifier: 'at a conservative X'. Give the actual number or cut the sentence.",
+        "hard_fail",
+    ),
+    (
+        "forced_negation_not_generic",
+        re.compile(r"\bnot\s+(?:a\s+)?generic\s+\w+", re.IGNORECASE),
+        "Forced negation: 'not a generic X'. State what you ARE, not what you're not.",
+        "hard_fail",
+    ),
 ]
 
 # Banned phrases (substring match, case-insensitive)
@@ -203,6 +267,14 @@ CONSULTANT_VOICE_PHRASES = [
     "surfacing search mandates",
     "client development ceiling",
     "capacity constraint",
+    # Round 4 / Tier C.8: substring-only additions catching what the V2
+    # writer emitted in Jonathan's emails. These are phrase-level rather
+    # than regex-level (i.e. too short/general to regex) — substring match
+    # is sufficient.
+    "the gap I see",
+    "messaging angle",
+    "the firms I work with",
+    "at a conservative average",
 ]
 
 # Structural bounds (T2.3)
@@ -284,7 +356,54 @@ class Violation(NamedTuple):
         if self.pattern_type.startswith("template_compliment"):
             return "Replace with a data-grounded observation about the recipient."
         if self.pattern_type.startswith("forced_negation"):
+            if self.pattern_type == "forced_negation_on_its_own":
+                return (
+                    "Drop the 'doesn't X on its own' construction. State the "
+                    "adjacent positive claim: what DOES move the needle, not "
+                    "what doesn't."
+                )
+            if self.pattern_type == "forced_negation_not_generic":
+                return (
+                    "Delete the 'not a generic X' clause. If your positive "
+                    "claim is specific enough, the contrast is implied."
+                )
             return "State the positive claim as its own sentence, no 'not X, but Y' contrast."
+        if self.pattern_type == "consultant_gap_framing":
+            return (
+                "Drop 'the gap I see for firms...'. State the gap directly: "
+                "'The harder part at your size is [specific failure mode].'"
+            )
+        if self.pattern_type == "universality_cant_match":
+            return (
+                "Delete the 'most Xs can't match' clause. If the recipient's "
+                "advantage is obvious from the facts, you don't need to rank "
+                "it against the market."
+            )
+        if self.pattern_type == "vague_intensifier_real":
+            return (
+                "Replace 'a real [edge/advantage/...]' with the specific "
+                "mechanism. If the edge is real, name what creates it."
+            )
+        if self.pattern_type == "vague_intensifier_meaningful":
+            return (
+                "Replace 'a meaningful [return/difference/...]' with an "
+                "actual number (dollar figure, multiplier, or percentage)."
+            )
+        if self.pattern_type == "consultant_firms_i_work_with":
+            return (
+                "Replace 'the firms I work with typically...' with a "
+                "singular proof point: 'One client [verb'd] [number].'"
+            )
+        if self.pattern_type == "fake_opinion_signal":
+            return (
+                "Drop 'that's the signal that separates...'. State what the "
+                "signal means directly: 'A GC pulling permits has a project.'"
+            )
+        if self.pattern_type == "vague_conservative_estimate":
+            return (
+                "Replace 'at a conservative [estimate/average]' with the "
+                "actual number. If no number exists, cut the sentence."
+            )
         if self.pattern_type == "banned_phrase":
             return f"Remove the banned phrase '{self.excerpt.strip()}' entirely."
         if self.pattern_type == "banned_adjective":

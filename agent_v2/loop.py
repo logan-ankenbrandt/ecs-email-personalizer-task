@@ -139,6 +139,7 @@ def call_with_tools_loop(
     temperature: Optional[float] = None,
     max_retries: int = 3,
     client: Optional[anthropic.Anthropic] = None,
+    pre_turn_hook: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> LoopResult:
     """Run a multi-turn tool-use loop.
 
@@ -168,17 +169,55 @@ def call_with_tools_loop(
     usage = TokenUsage()
 
     for turn in range(max_turns):
+        # Round 4 Tier B.1: pre-turn hook lets the caller compact `messages`
+        # (remove stale tool_result content) BEFORE the next API call. Runs
+        # every turn; the hook is responsible for no-op'ing when history is
+        # short. Keeps the per-turn input token cost bounded as the session
+        # accumulates tool calls.
+        if pre_turn_hook is not None:
+            try:
+                pre_turn_hook(messages)
+            except Exception as e:  # noqa: BLE001 — never crash the loop on a hook
+                logger.warning(
+                    "pre_turn_hook raised (continuing without): %s", e,
+                )
+
         create_kwargs: Dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens_per_turn,
             "system": system_prompt,
             "tools": tools,
             "messages": messages,
+            # Tier B.4: Anthropic server-side context_management. Clears
+            # oldest tool_use/tool_result pairs when input tokens approach
+            # 80K. Works alongside our client-side pre_turn_hook compactor
+            # (Tier B.1) as a safety net. If the SDK version doesn't
+            # support this kwarg, Anthropic will reject the request; we
+            # catch that case by stripping the key and retrying.
+            "context_management": {
+                "strategy": "clear_tool_uses_20250919",
+                "config": {
+                    "trigger_input_tokens": 80_000,
+                    "target_input_tokens": 30_000,
+                },
+            },
         }
         if temperature is not None:
             create_kwargs["temperature"] = temperature
 
-        response = _call_with_retry(client, create_kwargs, max_retries)
+        try:
+            response = _call_with_retry(client, create_kwargs, max_retries)
+        except anthropic.BadRequestError as e:
+            # SDK or API rejects context_management kwarg → retry once
+            # without it so we don't hard-fail on older backends.
+            if "context_management" in str(e):
+                logger.warning(
+                    "context_management kwarg rejected; retrying without: %s", e,
+                )
+                create_kwargs.pop("context_management", None)
+                response = _call_with_retry(client, create_kwargs, max_retries)
+            else:
+                raise
 
         # Accumulate tokens (SDK response.usage is always present for
         # successful calls; defensive getattr anyway).
