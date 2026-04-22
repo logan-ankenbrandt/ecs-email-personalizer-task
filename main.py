@@ -70,6 +70,13 @@ def main() -> None:
         "--rewrite_recipient_id", type=str, default=None,
         help="Recipient ID for --rewrite_scope=recipient. Ignored otherwise.",
     )
+    parser.add_argument(
+        "--use_orchestrator_v2", action="store_true",
+        help="Round 3 Phase 2 opt-in. Routes this run through the "
+             "Claude-Code-style Opus orchestrator (agent_v2) instead of the "
+             "legacy write/judge/refine pipeline. Surfaced to the UI per-run; "
+             "when absent, the run uses V1.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -134,6 +141,14 @@ def main() -> None:
     except ValueError as e:
         logger.error("API key error: %s", e)
         sys.exit(1)
+
+    # Round 3 Phase 2 opt-in. The pipeline reads ORCHESTRATOR_V2 via
+    # os.getenv() inside _personalize_one_recipient; setting it here (before
+    # PersonalizerPipeline is constructed) routes this run through the
+    # Opus orchestrator.
+    if args.use_orchestrator_v2:
+        os.environ["ORCHESTRATOR_V2"] = "1"
+        logger.info("ORCHESTRATOR_V2 enabled for this run")
 
     logger.info(
         "Starting email-personalizer: org=%s sequence=%s run=%s concurrency=%d max=%s",
