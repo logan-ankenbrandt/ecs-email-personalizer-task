@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import RESEARCH_MODEL
+from utils.research import _extract_website
 from utils.web_fetch import fetch_url_cached, normalize_url
 
 from agent_v2.loop import LoopResult, ToolResult, TokenUsage, call_with_tools_loop
@@ -36,17 +37,11 @@ def _build_researcher_task(recipient: Dict[str, Any], focus: Optional[str]) -> s
     company = recipient.get("business_name") or recipient.get("company") or "(unknown company)"
     location = recipient.get("location") or recipient.get("city") or "(unknown location)"
 
-    # Prefer explicit website fields; fall back to email domain.
-    website = (
-        recipient.get("company_website")
-        or recipient.get("website")
-        or (recipient.get("custom_fields") or {}).get("company_website")
-        or ""
-    )
-    if not website and recipient.get("email"):
-        domain = recipient["email"].split("@")[-1].strip().lower() if "@" in recipient["email"] else ""
-        if domain and "." in domain and domain not in {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com"}:
-            website = f"https://{domain}"
+    # _extract_website handles v1/v2 schema split (custom_fields is a list
+    # of {key,value} in production) and the email-domain fallback. Using
+    # it here avoids the 'list' object has no attribute 'get' crash the
+    # naive dict access hit on real recipient docs.
+    website = _extract_website(recipient) or ""
 
     lines: List[str] = [
         f"## Recipient",

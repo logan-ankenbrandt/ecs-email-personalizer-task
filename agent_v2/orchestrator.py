@@ -27,7 +27,7 @@ from config import (
 from utils.cost import CostAccumulator, usd_for_tokens
 from utils.merge_fields import build_merge_dict, resolve_merge_fields
 from utils.mongo import upsert_personalized_email
-from utils.research import build_recipient_summary
+from utils.research import _extract_website, build_recipient_summary
 
 from agent_v2.budget import Budget
 from agent_v2.loop import ToolResult, call_with_tools_loop
@@ -153,11 +153,11 @@ def run_for_recipient(
     # Quality thresholds depend on whether we have research capability.
     # We don't yet know if the researcher will succeed; start with the
     # has-research tier, then downgrade after gap detection if needed.
-    has_website = bool(
-        recipient.get("company_website")
-        or recipient.get("website")
-        or (recipient.get("custom_fields") or {}).get("company_website")
-    )
+    # Use _extract_website (utils.research) to handle the v1/v2 schema
+    # split where custom_fields is a list of {key, value} in production.
+    # Bug: the previous inline dict access crashed with
+    # "'list' object has no attribute 'get'" on real recipient docs.
+    has_website = bool(_extract_website(recipient))
     effective_threshold = QUALITY_THRESHOLD if has_website else QUALITY_THRESHOLD_NO_RESEARCH
     effective_floor = QUALITY_HARD_FLOOR if has_website else QUALITY_HARD_FLOOR_NO_RESEARCH
 
