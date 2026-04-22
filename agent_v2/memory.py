@@ -199,9 +199,20 @@ class RecipientMemory:
         days" across 3 of 4 steps despite the existing prior_summary; the
         explicit banlist is more emphatic than the soft "proof points"
         mention below.
+
+        Round 4.7: also scans memory.drafts (in-flight writer results not
+        yet submitted) for prior-step signatures. v8 recycled step 1's
+        signatures into step 2 because the orchestrator dispatched writer
+        for step 2 BEFORE calling submit_step for step 1 — so memory.accepted
+        was empty when step 2's writer ran, even though step 1's draft
+        existed in memory.drafts. Including drafts closes the window.
         """
         parts: List[str] = []
         all_signatures: set = set()
+
+        # Primary source: accepted drafts. These drive the narrative
+        # "Step N: opener / proof points" blocks (what the recipient will
+        # actually receive).
         for earlier_step in sorted(self.accepted.keys()):
             if earlier_step >= step:
                 continue
@@ -212,8 +223,38 @@ class RecipientMemory:
             if d.proof_points:
                 lines.append(f"  proof points: {d.proof_points}")
             parts.append("\n".join(lines))
-            # Accumulate normalized signatures from this prior step.
             all_signatures |= extract_proof_signatures(d.raw_content or "")
+
+        # Secondary source: in-flight drafts for earlier steps that have
+        # not yet been submit_step'd. Prevents the batched-dispatch race
+        # where step 2's writer is called before step 1 is accepted. We
+        # keep only the signatures (don't duplicate the narrative) so the
+        # BANNED block covers every earlier step that has a draft,
+        # accepted or not.
+        accepted_steps_seen = set(self.accepted.keys())
+        drafts_by_step: Dict[int, Dict[str, Any]] = {}
+        for _draft_id, draft in self.drafts.items():
+            try:
+                d_step = int(draft.get("step", 0))
+            except (TypeError, ValueError):
+                continue
+            if d_step <= 0 or d_step >= step or d_step in accepted_steps_seen:
+                continue
+            # If multiple drafts exist for the same earlier step (retry),
+            # keep the LAST one (dict iteration is insertion-ordered in
+            # Python 3.7+, so overwriting here preserves latest).
+            drafts_by_step[d_step] = draft
+        for d_step in sorted(drafts_by_step.keys()):
+            all_signatures |= extract_proof_signatures(
+                drafts_by_step[d_step].get("content", "") or ""
+            )
+            # If no accepted narrative exists for this step, note that
+            # it's in-flight so the writer knows the prior content is
+            # real (not speculative).
+            parts.append(
+                f"Step {d_step} (in-flight draft, not yet submitted — "
+                f"treat as locked-in for proof-point purposes)"
+            )
 
         if not parts:
             return ""
