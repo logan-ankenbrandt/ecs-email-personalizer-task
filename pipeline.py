@@ -533,6 +533,10 @@ class PersonalizerPipeline:
         self.failed_ids: Set[str] = set()
         # In targeted mode, maps recipient_id -> set of steps to run.
         self._target_steps_by_rid: Dict[str, Set[int]] = {}
+        # P1.4: count of gap-fill targets (steps that had no existing
+        # personalized doc but are present in the template). Used in final
+        # telemetry so the operator can see if gap recovery fired.
+        self._gap_fill_count: int = 0
 
     @property
     def is_rewrite(self) -> bool:
@@ -674,8 +678,10 @@ class PersonalizerPipeline:
             failed_recipient_ids=list(self.failed_ids),
         )
         logger.info(
-            "Personalization run complete: completed=%d failed=%d total_cost=$%.2f",
-            len(self.completed_ids), len(self.failed_ids), metadata["_total_usd"],
+            "Personalization run complete: completed=%d failed=%d "
+            "gaps_attempted=%d total_cost=$%.2f",
+            len(self.completed_ids), len(self.failed_ids),
+            self._gap_fill_count, metadata["_total_usd"],
         )
         return metadata
 
@@ -794,6 +800,16 @@ class PersonalizerPipeline:
                     any_step_succeeded = True
                     if signal:
                         prior_step_signals.append(signal)
+                else:
+                    # P1.4: both writer attempts failed. This step will have
+                    # no personalized doc in Mongo. Without gap-fill (P1.1)
+                    # fixing the retry path, this was a permanent data loss.
+                    # Log distinctly so it shows up in CloudWatch grep.
+                    logger.warning(
+                        "step=%d recipient=%s reason=permanent_skip "
+                        "attempts=2 has_website=%s",
+                        step, rid, bool(company_brief),
+                    )
             except Exception as e:
                 logger.error(
                     "Step %d for recipient %s crashed: %s",
@@ -928,6 +944,24 @@ class PersonalizerPipeline:
         company_insight = writer_result.get("company_insight", "")
         data_grounding = writer_result.get("data_grounding", [])
         advisor_used = writer_result.get("advisor_used", False)
+
+        # P1.2: deterministic post-processing. Em-dashes and missing signature
+        # links were the top two slop violations in production logs. Sonnet
+        # re-introduces em dashes on every refine pass, and the refiner
+        # cannot reliably add HTML links. Fix them before the judge ever sees
+        # the draft so we stop burning refine iterations on regex-solvable
+        # problems.
+        from utils.sanitize import enforce_signature, sanitize_punctuation
+        orig_had_link = "withcold.com" in (content or "").lower()
+        orig_had_emdash = "\u2014" in (content or "") or "\u2014" in (subject or "")
+        subject = sanitize_punctuation(subject)
+        content = sanitize_punctuation(content)
+        content = enforce_signature(content)
+        if orig_had_emdash or not orig_had_link:
+            logger.info(
+                "sanitize recipient=%s step=%d em_dash_fixed=%s signature_injected=%s",
+                rid, step, orig_had_emdash, not orig_had_link,
+            )
 
         # B.3: log whether the writer actually emitted a withcold.com link in
         # raw output. Post-A.1 the validator no longer false-positives on
@@ -1104,6 +1138,25 @@ class PersonalizerPipeline:
             )
             return False, None
 
+        # P1.3: diagnostic log BEFORE the regression guard so we can tell
+        # whether the guard failed to fire (bug) vs fired correctly. Round 3
+        # log review found 3 accepted rewrites where score dropped from
+        # 0.81->0.62, 0.72->0.68, 0.78->0.68. The guard should have caught
+        # at least the first. Either is_rewrite was false or final_score
+        # differs from what we log. This line surfaces all the inputs.
+        logger.info(
+            "regression_guard_check recipient=%s step=%d is_rewrite=%s "
+            "has_prev_version=%s prev_score=%s final_score=%.3f delta=%s "
+            "feedback=%s",
+            rid, step, self.is_rewrite, previous_version is not None,
+            f"{prev_score:.3f}" if isinstance(prev_score, (int, float)) else "none",
+            final_score,
+            f"{prev_score - final_score:.3f}"
+            if isinstance(prev_score, (int, float))
+            else "n/a",
+            bool(self.feedback),
+        )
+
         # A1 + B.1: regression guard. When a rewrite would replace an
         # existing doc with a LOWER-scoring version, keep the old one.
         # B.1: the old carve-out `and not self.feedback` let feedback-driven
@@ -1191,14 +1244,22 @@ class PersonalizerPipeline:
     # ────────────────────────────────────────────────────────────
 
     def _resolve_targets_from_scope(self) -> List[Dict[str, Any]]:
-        """Build the target list for a bulk-scope rewrite by querying the
-        existing personalized_sequence_emails docs for this sequence.
+        """Build the target list for a bulk-scope rewrite.
 
         - scope='recipient': filters by recipient_id
         - scope='all': no recipient filter
 
-        Projects only (recipient_id, step) fields. Returns a plain list of
-        dicts compatible with the rest of the targeted-rewrite pipeline.
+        P1.1 (gap-fill): previously only queried existing
+        personalized_sequence_emails docs, so any step that failed on the
+        initial full-batch run (below hard floor, writer timeout, crash) was
+        permanently invisible to rewrite runs. Jonathan Smith's step 3 sat
+        permanently missing across 3 subsequent scope=recipient retries for
+        exactly this reason.
+
+        Now we union existing personalized docs with all template steps for
+        each affected recipient. Any (recipient_id, step) pair that exists
+        in the template but has no personalized doc becomes a gap-fill
+        target: the retry gets a chance to produce it.
         """
         from utils.mongo import _get_primary_db
         db = _get_primary_db()
@@ -1212,13 +1273,47 @@ class PersonalizerPipeline:
                     f"rewrite_recipient_id but got {self.rewrite_recipient_id!r}"
                 )
             query["recipient_id"] = str(self.rewrite_recipient_id)
-        cursor = db.personalized_sequence_emails.find(
-            query, {"recipient_id": 1, "step": 1, "_id": 0},
+        existing = list(
+            db.personalized_sequence_emails.find(
+                query, {"recipient_id": 1, "step": 1, "_id": 0},
+            )
         )
-        return [
-            {"recipient_id": doc["recipient_id"], "step": int(doc["step"])}
-            for doc in cursor
+        existing_pairs: Set[Tuple[str, int]] = {
+            (d["recipient_id"], int(d["step"])) for d in existing
+        }
+
+        # Template steps for this sequence are already loaded in run() and
+        # stored on self.template_emails. Reuse that list to avoid a second
+        # Mongo query.
+        template_steps: Set[int] = {
+            int(t.get("step", 0)) for t in self.template_emails
+        }
+
+        if self.rewrite_scope == "recipient":
+            rids: List[str] = [str(self.rewrite_recipient_id)]
+        else:
+            rids = sorted({p[0] for p in existing_pairs})
+
+        targets: List[Dict[str, Any]] = [
+            {"recipient_id": rid, "step": step} for rid, step in existing_pairs
         ]
+        gap_count = 0
+        for rid in rids:
+            for step in template_steps:
+                if (rid, step) not in existing_pairs:
+                    targets.append({"recipient_id": rid, "step": step})
+                    gap_count += 1
+                    logger.info(
+                        "gap_fill recipient=%s step=%d (no existing doc)",
+                        rid, step,
+                    )
+        self._gap_fill_count = gap_count
+        if gap_count:
+            logger.info(
+                "gap_fill_total scope=%s count=%d existing=%d",
+                self.rewrite_scope, gap_count, len(existing_pairs),
+            )
+        return targets
 
     def _fetch_recipients_by_ids(
         self, recipient_ids: List[str],
