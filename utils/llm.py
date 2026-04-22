@@ -27,7 +27,9 @@ def generate_structured(
     max_tokens: int = 8192,
     max_retries: int = 5,
     temperature: float = 0.0,
-) -> dict:
+    system: str = "",
+    return_usage: bool = False,
+):
     """Call Anthropic API with tool-use to get structured JSON output.
 
     Uses the forced tool_choice pattern: define a "submit_output" tool
@@ -43,9 +45,16 @@ def generate_structured(
         temperature: Sampling temperature. Defaults to 0.0 so that judges and
             other structured-output callers score deterministically. Set
             higher (e.g. 0.2) for refinement where light variation helps.
+        system: Optional system prompt. When empty, no system is sent.
+            Added in Round 3 Phase 2 so critic sub-agent can pass a full
+            rubric system prompt.
+        return_usage: When True, return (dict, {"input_tokens": int,
+            "output_tokens": int}) instead of just dict. Default False
+            preserves the existing V1 callers.
 
     Returns:
-        Parsed dict from the tool call input.
+        Parsed dict from the tool call input, OR (dict, usage_counts) if
+        return_usage=True.
 
     Raises:
         ValueError: If the response contains no tool_use block.
@@ -62,14 +71,17 @@ def generate_structured(
     last_error = None
     for attempt in range(max_retries + 1):
         try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[tool],
-                tool_choice={"type": "tool", "name": "submit_output"},
-            )
+            create_kwargs: dict = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [tool],
+                "tool_choice": {"type": "tool", "name": "submit_output"},
+            }
+            if system:
+                create_kwargs["system"] = system
+            response = client.messages.create(**create_kwargs)
 
             # Extract the tool_use block
             for block in response.content:
@@ -80,6 +92,11 @@ def generate_structured(
                         response.usage.input_tokens,
                         response.usage.output_tokens,
                     )
+                    if return_usage:
+                        return block.input, {
+                            "input_tokens": response.usage.input_tokens,
+                            "output_tokens": response.usage.output_tokens,
+                        }
                     return block.input
 
             raise ValueError(

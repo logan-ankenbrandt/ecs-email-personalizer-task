@@ -736,6 +736,40 @@ class PersonalizerPipeline:
         Returns True if at least one step was successfully written.
         """
         rid = str(recipient["_id"])
+
+        # Round 3 Phase 2: Claude-Code-style orchestrator path. One Opus
+        # orchestrator session per recipient; dispatches Sonnet sub-agents
+        # (researcher, writer) and Opus critic. Replaces the write/judge/
+        # refine loop below. Activated via env flag; rollback is a one-
+        # env-var flip.
+        import os as _os
+        if _os.getenv("ORCHESTRATOR_V2") == "1":
+            from agent_v2.orchestrator import run_for_recipient
+            target_steps_v2 = (
+                self._target_steps_by_rid.get(rid) if self.targets else None
+            )
+            result = run_for_recipient(
+                recipient=recipient,
+                sequence_doc=self.sequence_doc or {},
+                template_emails=self.template_emails,
+                target_steps=target_steps_v2,
+                is_rewrite=self.is_rewrite,
+                feedback=self.feedback,
+                previous_versions_fn=self._snapshot_existing_for_history,
+                sequence_id=self.sequence_id,
+                personalization_run_id=self.personalization_run_id,
+                cost_tracker=self.cost,
+                quality_example=self._quality_example or "",
+            )
+            logger.info(
+                "orchestrator_v2 recipient=%s submitted=%s skipped=%s "
+                "cost=$%.4f turns=%d exhausted=%s",
+                rid, result.steps_submitted, result.steps_skipped,
+                result.total_cost_usd, result.turns_used,
+                result.budget_exhausted,
+            )
+            return result.any_step_succeeded
+
         recipient_summary = build_recipient_summary(recipient)
         # Pre-fetch + summarize the company website ONCE, share across all steps
         company_brief = build_company_brief(recipient)
