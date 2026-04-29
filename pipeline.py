@@ -66,6 +66,7 @@ CHECKPOINT_EVERY_N = 50  # write checkpoint after this many recipients complete
 _RULE_FILES: tuple = (
     "alignment.md",
     "formatting.md",
+    "grammar.md",
     "quality.md",
     "slop.md",
     "structure.md",

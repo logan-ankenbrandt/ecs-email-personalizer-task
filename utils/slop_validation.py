@@ -13,9 +13,241 @@ context to anchor swap tests).
 
 import logging
 import re
+import statistics
 from typing import List, NamedTuple
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Grammar / rhythm rule helpers (R0-R7, see grammar.md)
+# ============================================================
+
+# Lightweight POS heuristics. No spaCy dependency. Word lists cover the
+# tokens we care about for opener-class detection (R3, R4, R6).
+_DET_TOKENS = {
+    "the", "a", "an", "those", "that", "this", "these", "your", "our",
+}
+_PRON_TOKENS = {"i", "we", "you", "they", "it"}
+# Verb word list used for two purposes:
+#   1. R1 staccato exemption: <=3 word sentences with no verb match are
+#      treated as intentional fragments (e.g. "Healthcare. Construction. IT.")
+#      and excluded from the short-run counter.
+#   2. R3/R4/R6 opener classification: VERB lookup for imperative / verb-led
+#      sentence detection.
+_VERB_TOKENS_HEURISTIC = {
+    "is", "are", "was", "were", "run", "runs", "build", "builds",
+    "has", "had", "do", "does",
+}
+_VERB_PRESENCE_RE = re.compile(
+    r"\b(?:is|are|was|were|run|runs|build|builds|has|had|do|does)\b",
+    re.IGNORECASE,
+)
+# Broader verb-shape heuristic for R7 (independent-clause detection).
+# Catches common -s / -ed / -ing inflections and a small set of irregulars
+# that the R1 exemption list deliberately excludes. This is intentionally
+# loose (some adjectives ending in -ed will match) because R7 only fires
+# on 3+ comma-joined clauses, so a one-off false match in a single clause
+# is harmless.
+_VERB_SHAPE_RE = re.compile(
+    r"\b(?:\w{2,}(?:s|ed|ing)|is|are|was|were|be|been|being|has|had|have|"
+    r"do|does|did|made|make|makes|run|runs|ran|build|builds|built|"
+    r"send|sends|sent|got|get|gets|gives|give|gave|tell|tells|told|"
+    r"work|works|worked|see|sees|saw|come|comes|came|go|goes|went|"
+    r"keep|keeps|kept|put|puts|hold|holds|held)\b",
+    re.IGNORECASE,
+)
+
+# FANBOYS coordinating-conjunction joiner (R2). Looks for ", and " family
+# patterns. Subordinators (R2 second pass) count as flow indicators even
+# when no FANBOYS joiner is present.
+_FANBOYS_JOINER_RE = re.compile(
+    r",\s+(?:and|but|so|yet|or|for|nor)\s+",
+    re.IGNORECASE,
+)
+_SUBORDINATOR_RE = re.compile(
+    r"\b(?:because|while|if|when|since|although|though|whereas|unless|"
+    r"until|after|before)\b",
+    re.IGNORECASE,
+)
+_SUBORDINATE_LEAD_TOKENS = {
+    "if", "when", "while", "because", "since", "although", "though",
+    "after", "before", "unless", "until", "whereas",
+}
+
+# Paragraph segmentation runs on the RAW (pre-strip) HTML so paragraph
+# boundaries survive. _strip_html collapses all whitespace.
+_PARAGRAPH_SPLIT_RE = re.compile(
+    r"</p\s*>|<p[^>]*>|<br\s*/?>\s*<br\s*/?>|\n{2,}",
+    re.IGNORECASE,
+)
+
+# Bare-name greeting (R0): a single titlecase word followed by a comma
+# and nothing else on the line (e.g. "Logan,"). The accepted form is
+# "Hi Logan," / "Hey Logan,".
+_BARE_NAME_GREETING_RE = re.compile(r"^[A-Z][a-z]+,$")
+
+
+def _split_paragraphs(raw_content: str) -> List[str]:
+    """Split raw HTML body into per-paragraph stripped text.
+
+    Splits on </p>, <p>, <br><br>, and blank lines BEFORE running
+    _strip_html, since _strip_html collapses whitespace and would erase
+    paragraph boundaries. Returns paragraphs in document order with empty
+    strings dropped.
+    """
+    if not raw_content:
+        return []
+    chunks = _PARAGRAPH_SPLIT_RE.split(raw_content)
+    paragraphs: List[str] = []
+    for chunk in chunks:
+        stripped = _strip_html(chunk) if chunk else ""
+        if stripped:
+            paragraphs.append(stripped)
+    return paragraphs
+
+
+def _first_token(sentence: str) -> str:
+    """Return the first whitespace-separated token, with surrounding
+    punctuation stripped. Empty string if no token."""
+    parts = sentence.strip().split()
+    if not parts:
+        return ""
+    return parts[0].strip(".,;:!?\"'()[]")
+
+
+_GREETING_TOKENS = {"hi", "hey", "hello"}
+_INTERJECTION_TOKENS = {"hi", "hey", "hello", "yes", "no", "okay", "ok", "sure"}
+_QUANTIFIER_TOKENS = {"one", "two", "three", "four", "five", "six", "many", "few", "some", "most"}
+
+
+def _classify_pos(token: str) -> str:
+    """Coarse POS classification using word lists + suffix heuristics.
+
+    Returns one of: 'DET', 'PRON', 'VERB', 'PROPN', 'NOUN', 'OTHER'.
+
+    Conservative on the NOUN fallback: only commits to NOUN when the
+    token has clear noun-ish shape (lowercase, no -ing/-ed/-ly suffix).
+    Subordinators, interjections, quantifiers, and adverbs all return
+    OTHER so the soft POS-class run check (R3, R4) doesn't pile false
+    positives onto syntactically diverse sentences that happen to begin
+    with non-DET/PRON/VERB tokens.
+    """
+    if not token:
+        return "OTHER"
+    lower = token.lower()
+    if lower in _DET_TOKENS:
+        return "DET"
+    if lower in _PRON_TOKENS:
+        return "PRON"
+    if lower in _VERB_TOKENS_HEURISTIC:
+        return "VERB"
+    if lower in _SUBORDINATE_LEAD_TOKENS:
+        return "OTHER"
+    if lower in _INTERJECTION_TOKENS:
+        return "OTHER"
+    if lower in _QUANTIFIER_TOKENS:
+        return "OTHER"
+    if lower.endswith("ly") and len(lower) > 3:
+        return "OTHER"
+    if lower.endswith(("ing", "ed")) and len(lower) > 4:
+        return "VERB"
+    if lower.endswith("s") and len(lower) > 3 and not token[0].isupper():
+        return "VERB"
+    if token[:1].isupper() and not token.isupper():
+        return "PROPN"
+    return "NOUN"
+
+
+def _opener_bigram_class(sentence: str) -> str:
+    """Classify the first 2-token bigram of a sentence (R3).
+
+    Returns one of 'DET_NOUN', 'PRON_VERB', 'PROPN_VERB', or 'OTHER'.
+    """
+    parts = [p.strip(".,;:!?\"'()[]") for p in sentence.strip().split()]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return "OTHER"
+    a = _classify_pos(parts[0])
+    b = _classify_pos(parts[1])
+    if a == "DET" and b in {"NOUN", "PROPN"}:
+        return "DET_NOUN"
+    if a == "PRON" and b == "VERB":
+        return "PRON_VERB"
+    if a == "PROPN" and b == "VERB":
+        return "PROPN_VERB"
+    return "OTHER"
+
+
+def _classify_first_sentence_pattern(sentence: str) -> str:
+    """Classify the first sentence of a paragraph (R6).
+
+    Returns one of: 'DECLARATIVE_NOUN_LEAD', 'SUBORDINATE_LEAD', 'QUESTION',
+    'IMPERATIVE', 'FRAGMENT'.
+    """
+    s = sentence.strip()
+    if not s:
+        return "FRAGMENT"
+    if s.endswith("?"):
+        return "QUESTION"
+    tokens = [t.strip(".,;:!?\"'()[]") for t in s.split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return "FRAGMENT"
+    first_lower = tokens[0].lower()
+    has_verb = bool(_VERB_PRESENCE_RE.search(s))
+    if not has_verb and len(tokens) <= 6:
+        return "FRAGMENT"
+    if first_lower in _SUBORDINATE_LEAD_TOKENS:
+        return "SUBORDINATE_LEAD"
+    # Comma within first 6 tokens signals a leading subordinate clause.
+    head = " ".join(tokens[:6])
+    if "," in head and first_lower not in _DET_TOKENS and first_lower not in _PRON_TOKENS:
+        # Only treat as subordinate lead if the leading clause looks
+        # like a clause, not a list. Check for a subordinator keyword.
+        if _SUBORDINATOR_RE.search(head):
+            return "SUBORDINATE_LEAD"
+    if first_lower in _VERB_TOKENS_HEURISTIC:
+        return "IMPERATIVE"
+    if _classify_pos(tokens[0]) == "VERB" and tokens[0][:1].islower():
+        return "IMPERATIVE"
+    return "DECLARATIVE_NOUN_LEAD"
+
+
+def _strip_leading_greeting(sentence: str) -> str:
+    """Remove a leading "Hi/Hey/Hello <Name>," prefix from a sentence.
+
+    _strip_html collapses paragraph boundaries, so the greeting paragraph
+    ("Hi Logan,") gets concatenated into the first body sentence. This
+    helper trims the greeting prefix so opener-class analysis sees the
+    actual first body token. If no greeting prefix is present the
+    sentence is returned unchanged.
+    """
+    s = sentence.strip()
+    if not s:
+        return s
+    parts = s.split(None, 2)
+    if not parts:
+        return s
+    if parts[0].lower() not in _GREETING_TOKENS:
+        return s
+    if len(parts) < 3:
+        return ""
+    if parts[1].endswith(","):
+        return parts[2].strip()
+    return s
+
+
+def _is_skippable_paragraph_for_r6(paragraph: str) -> bool:
+    """R6 skips paragraphs starting with digit + period or open quote."""
+    s = paragraph.lstrip()
+    if not s:
+        return True
+    if re.match(r"^\d+\.", s):
+        return True
+    if s[:1] in {"\"", "'", "“", "‘"}:
+        return True
+    return False
 
 
 # ============================================================
@@ -375,6 +607,20 @@ class Violation(NamedTuple):
             return f"Consultant voice / invented terminology: {self.excerpt}"
         if self.pattern_type == "sentence_too_long":
             return "Sentence exceeds 25-word cap; Cash gold-standard caps at 22"
+        if self.pattern_type == "greeting_too_terse":
+            return "Bare-name greeting; opens with just '<Name>,' instead of 'Hi <Name>,'"
+        if self.pattern_type == "fanboys_density_low":
+            return "Paragraph has 3+ sentences with no coordinating conjunction or subordinator"
+        if self.pattern_type == "paragraph_opener_monotony":
+            return "3+ paragraphs in a row open with the same grammatical structure"
+        if self.pattern_type == "sentence_opener_repetition":
+            return "3+ consecutive sentences share the same opener token or POS class"
+        if self.pattern_type == "length_rhythm_flat":
+            return "Sentence-length variance too low (flat rhythm)"
+        if self.pattern_type == "paragraph_grammar_uniformity":
+            return "3+ paragraphs share the same first-sentence syntactic pattern"
+        if self.pattern_type == "comma_stack_parallel":
+            return "3+ comma-joined parallel independent clauses with no conjunction"
         return self.pattern_type
 
     def _suggestion(self) -> str:
@@ -498,6 +744,53 @@ class Violation(NamedTuple):
             )
         if self.pattern_type == "postscript_line":
             return "Remove the P.S. line. Not in the gold-standard template."
+        if self.pattern_type == "greeting_too_terse":
+            return (
+                "Open with 'Hi {first_name},' or 'Hey {first_name},' rather "
+                "than just the name. The bare-name greeting reads mechanical."
+            )
+        if self.pattern_type == "fanboys_density_low":
+            return (
+                "This paragraph has three or more sentences with no "
+                "coordinating conjunction. Merge two related sentences with "
+                "'and', 'but', or 'so' to give it flow."
+            )
+        if self.pattern_type == "paragraph_opener_monotony":
+            return (
+                "Three paragraphs in a row open with the same grammatical "
+                "structure. Rewrite at least one to start with a "
+                "subordinate clause, a question, or a different subject."
+            )
+        if self.pattern_type == "sentence_opener_repetition":
+            return (
+                "Three sentences in a row start with the same word. Vary "
+                "the openers, one can lead with a subordinate clause, an "
+                "adverb, or a question."
+            )
+        if self.pattern_type == "length_rhythm_flat":
+            return (
+                "The sentence-length rhythm is too flat. Add one longer "
+                "sentence (20+ words) with a subordinate clause, or break "
+                "a medium sentence into a punchy 4-6 word follow-up to "
+                "vary cadence."
+            )
+        if self.pattern_type == "paragraph_grammar_uniformity":
+            return (
+                "Every paragraph starts with the same grammatical pattern. "
+                "Try opening one paragraph with a question, a conditional "
+                "clause ('If...'), or a short imperative."
+            )
+        if self.pattern_type == "comma_stack_parallel":
+            return (
+                "Comma-stacked parallel clauses read as AI rhythm. Use "
+                "conjunctions or break into separate sentences."
+            )
+        if self.pattern_type == "staccato_repetition":
+            return (
+                "Combine these short sentences with conjunctions (and/but/so) "
+                "into one flowing sentence, or vary the lengths so no three "
+                "in a row are below 12 words."
+            )
         return "Rewrite the flagged excerpt."
 
     def to_judge_issue(self) -> dict:
@@ -544,18 +837,43 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 def _check_staccato(text: str, position: int, field: str) -> List[Violation]:
-    """Catch 3+ consecutive sentences each <8 words (staccato repetition)."""
+    """R1: staccato_short_run_v2.
+
+    Two triggers, both hard_fail:
+      A. 3+ consecutive sentences each <=12 words.
+      B. 2+ consecutive sentences each <=6 words.
+
+    Sentences with <=3 words AND no verb match are exempted from short-run
+    counting (handles intentional triplets like "Healthcare. Construction.
+    IT.") so they neither contribute to nor break a run.
+    """
     sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
-    short_run = 0
-    violations = []
+    violations: List[Violation] = []
+    run_le12: List[int] = []  # indices contributing to trigger A
+    run_le6: List[int] = []   # indices contributing to trigger B
     for i, s in enumerate(sentences):
         word_count = len(s.split())
-        if word_count < 8:
-            short_run += 1
-            if short_run >= 3:
-                # Capture the run of short sentences
-                run_start = max(0, i - 2)
-                excerpt = " ".join(sentences[run_start:i + 1])
+        is_exempt = word_count <= 3 and not _VERB_PRESENCE_RE.search(s)
+        if is_exempt:
+            # Exempt sentence: pass through without resetting or extending.
+            continue
+        if word_count <= 12:
+            run_le12.append(i)
+            if word_count <= 6:
+                run_le6.append(i)
+            else:
+                if len(run_le6) >= 2:
+                    excerpt = " ".join(sentences[run_le6[0]:run_le6[-1] + 1])
+                    violations.append(Violation(
+                        pattern_type="staccato_repetition",
+                        email_position=position,
+                        field=field,
+                        excerpt=excerpt,
+                        severity="hard_fail",
+                    ))
+                run_le6 = []
+            if len(run_le12) >= 3:
+                excerpt = " ".join(sentences[run_le12[0]:run_le12[-1] + 1])
                 violations.append(Violation(
                     pattern_type="staccato_repetition",
                     email_position=position,
@@ -563,9 +881,284 @@ def _check_staccato(text: str, position: int, field: str) -> List[Violation]:
                     excerpt=excerpt,
                     severity="hard_fail",
                 ))
-                short_run = 0  # reset to avoid duplicate flagging on same run
+                run_le12 = []
+                run_le6 = []
         else:
-            short_run = 0
+            if len(run_le6) >= 2:
+                excerpt = " ".join(sentences[run_le6[0]:run_le6[-1] + 1])
+                violations.append(Violation(
+                    pattern_type="staccato_repetition",
+                    email_position=position,
+                    field=field,
+                    excerpt=excerpt,
+                    severity="hard_fail",
+                ))
+            run_le12 = []
+            run_le6 = []
+    # Flush any remaining run_le6 at end of text.
+    if len(run_le6) >= 2:
+        excerpt = " ".join(sentences[run_le6[0]:run_le6[-1] + 1])
+        violations.append(Violation(
+            pattern_type="staccato_repetition",
+            email_position=position,
+            field=field,
+            excerpt=excerpt,
+            severity="hard_fail",
+        ))
+    return violations
+
+
+def _check_greeting_too_terse(
+    paragraphs: List[str], position: int,
+) -> List[Violation]:
+    """R0: bare-name greeting like "Logan," with no greeting word.
+
+    Examines the first non-empty paragraph of the body. Triggers if it
+    matches `^[A-Z][a-z]+,$`. Operates on paragraph segmentation rather
+    than sentence-split because _strip_html collapses paragraph
+    boundaries, which would concatenate the greeting with the next
+    paragraph's text and miss the bare-name signal.
+    """
+    if not paragraphs:
+        return []
+    first = paragraphs[0].strip()
+    if _BARE_NAME_GREETING_RE.match(first):
+        return [Violation(
+            pattern_type="greeting_too_terse",
+            email_position=position,
+            field="content",
+            excerpt=first,
+            severity="hard_fail",
+        )]
+    return []
+
+
+def _check_fanboys_density(paragraphs: List[str], position: int) -> List[Violation]:
+    """R2: paragraphs with >=3 sentences and zero coordinating-conjunction
+    joiners (FANBOYS: and/but/so/yet/or/for/nor) AND no subordinator
+    (because/while/if/...). Soft signal only."""
+    violations: List[Violation] = []
+    for para in paragraphs:
+        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(para) if s.strip()]
+        if len(sentences) < 3:
+            continue
+        if _FANBOYS_JOINER_RE.search(para):
+            continue
+        if _SUBORDINATOR_RE.search(para):
+            continue
+        violations.append(Violation(
+            pattern_type="fanboys_density_low",
+            email_position=position,
+            field="content",
+            excerpt=para[:200],
+            severity="deduction",
+        ))
+    return violations
+
+
+def _check_paragraph_opener_monotony(
+    paragraphs: List[str], position: int,
+) -> List[Violation]:
+    """R3: 3+ paragraphs in a row whose first 2-token bigram shares the
+    same opener class (DET_NOUN, PRON_VERB, PROPN_VERB). Skip greeting
+    (first) and signature (last) paragraphs. Soft for runs of 3, hard for
+    runs of 4+. Emits one violation per maximal run."""
+    violations: List[Violation] = []
+    if len(paragraphs) <= 2:
+        return violations
+    middle = paragraphs[1:-1]
+    classes = []
+    for para in middle:
+        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(para) if s.strip()]
+        first_sentence = sentences[0] if sentences else para
+        classes.append(_opener_bigram_class(first_sentence))
+
+    i = 0
+    while i < len(classes):
+        cls = classes[i]
+        if cls == "OTHER":
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(classes) and classes[j + 1] == cls:
+            j += 1
+        run_len = j - i + 1
+        if run_len >= 3:
+            severity = "hard_fail" if run_len >= 4 else "deduction"
+            excerpt = " | ".join(p[:80] for p in middle[i:j + 1])
+            violations.append(Violation(
+                pattern_type="paragraph_opener_monotony",
+                email_position=position,
+                field="content",
+                excerpt=f"[{cls} x{run_len}] {excerpt}",
+                severity=severity,
+            ))
+        i = j + 1
+    return violations
+
+
+def _check_sentence_opener_repetition(
+    text: str, position: int, field: str,
+) -> List[Violation]:
+    """R4: 3+ consecutive sentences sharing the same opener.
+
+    Hard fail when the lowercase first token is identical across 3+ in a
+    row. Soft (deduction) when the first-token POS class matches but the
+    tokens differ. Only one violation per maximal run; hard takes priority
+    over soft for the same run."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    # _strip_html collapses paragraph boundaries, so the greeting paragraph
+    # ("Hi Logan,") merges into the first body sentence. Strip a leading
+    # greeting-token + name + comma prefix so the actual first sentence's
+    # opener is what gets classified.
+    sentences = [_strip_leading_greeting(s) if i == 0 else s
+                 for i, s in enumerate(sentences)]
+    sentences = [s for s in sentences if s]
+    if len(sentences) < 3:
+        return []
+    tokens = [_first_token(s).lower() for s in sentences]
+    pos_classes = [_classify_pos(t) for t in tokens]
+    violations: List[Violation] = []
+
+    i = 0
+    while i < len(sentences):
+        if not tokens[i]:
+            i += 1
+            continue
+        # Literal-token run.
+        j = i
+        while j + 1 < len(tokens) and tokens[j + 1] == tokens[i] and tokens[i]:
+            j += 1
+        run_len = j - i + 1
+        if run_len >= 3:
+            excerpt = " ".join(sentences[i:j + 1])
+            violations.append(Violation(
+                pattern_type="sentence_opener_repetition",
+                email_position=position,
+                field=field,
+                excerpt=f"[token='{tokens[i]}' x{run_len}] {excerpt[:200]}",
+                severity="hard_fail",
+            ))
+            i = j + 1
+            continue
+        # POS-class run (soft) when literal run did not fire.
+        cls = pos_classes[i]
+        if cls in {"OTHER", ""}:
+            i += 1
+            continue
+        k = i
+        while k + 1 < len(pos_classes) and pos_classes[k + 1] == cls:
+            k += 1
+        pos_run = k - i + 1
+        if pos_run >= 3:
+            excerpt = " ".join(sentences[i:k + 1])
+            violations.append(Violation(
+                pattern_type="sentence_opener_repetition",
+                email_position=position,
+                field=field,
+                excerpt=f"[POS={cls} x{pos_run}] {excerpt[:200]}",
+                severity="deduction",
+            ))
+            i = k + 1
+            continue
+        i += 1
+    return violations
+
+
+def _check_length_rhythm_flat(text: str, position: int) -> List[Violation]:
+    """R5: across the body, sentence count >=5 AND mean word count in
+    [8,14] AND population stdev < 4. Soft signal only."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    counts = [len(s.split()) for s in sentences]
+    if len(counts) < 5:
+        return []
+    mean = sum(counts) / len(counts)
+    if mean < 8 or mean > 14:
+        return []
+    sd = statistics.pstdev(counts)
+    if sd >= 4:
+        return []
+    return [Violation(
+        pattern_type="length_rhythm_flat",
+        email_position=position,
+        field="content",
+        excerpt=f"[n={len(counts)}, mean={mean:.1f}, stdev={sd:.2f}]",
+        severity="deduction",
+    )]
+
+
+def _check_paragraph_grammar_uniformity(
+    paragraphs: List[str], position: int,
+) -> List[Violation]:
+    """R6: 3+ paragraphs sharing the same first-sentence syntactic pattern.
+
+    Skip greeting (first) and signature (last) paragraphs. Skip paragraphs
+    starting with digit + period or open quote. Soft v1."""
+    if len(paragraphs) <= 2:
+        return []
+    middle = paragraphs[1:-1]
+    indexed: List[tuple] = []  # list of (orig_index, pattern, paragraph)
+    for idx, para in enumerate(middle):
+        if _is_skippable_paragraph_for_r6(para):
+            continue
+        sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(para) if s.strip()]
+        first_sentence = sentences[0] if sentences else para
+        pattern = _classify_first_sentence_pattern(first_sentence)
+        indexed.append((idx, pattern, para))
+
+    violations: List[Violation] = []
+    if len(indexed) < 3:
+        return violations
+    i = 0
+    while i < len(indexed):
+        pattern = indexed[i][1]
+        j = i
+        while j + 1 < len(indexed) and indexed[j + 1][1] == pattern:
+            j += 1
+        run_len = j - i + 1
+        if run_len >= 3:
+            excerpt = " | ".join(p[:80] for _, _, p in indexed[i:j + 1])
+            violations.append(Violation(
+                pattern_type="paragraph_grammar_uniformity",
+                email_position=position,
+                field="content",
+                excerpt=f"[{pattern} x{run_len}] {excerpt}",
+                severity="deduction",
+            ))
+        i = j + 1
+    return violations
+
+
+def _check_comma_stack_parallel(
+    text: str, position: int, field: str,
+) -> List[Violation]:
+    """R7: 3+ comma-joined parallel independent clauses without a
+    coordinating conjunction within a single sentence. Hard fail.
+
+    Distinct from `tricolon_list` which requires explicit "and"/"or".
+    Heuristic: split sentence on commas, keep clauses that contain a verb
+    match. If we find 3+ verb-bearing clauses AND no FANBOYS joiner appears
+    in the sentence, flag it."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    violations: List[Violation] = []
+    for s in sentences:
+        if _FANBOYS_JOINER_RE.search(s):
+            continue
+        if "," not in s:
+            continue
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        if len(parts) < 3:
+            continue
+        verb_clauses = [p for p in parts if _VERB_SHAPE_RE.search(p)]
+        if len(verb_clauses) < 3:
+            continue
+        violations.append(Violation(
+            pattern_type="comma_stack_parallel",
+            email_position=position,
+            field=field,
+            excerpt=s[:200],
+            severity="hard_fail",
+        ))
     return violations
 
 
@@ -782,6 +1375,17 @@ def validate_email(subject: str, content: str, position: int) -> List[Violation]
             violations.extend(_check_staccato(text, position, field))
             # C.1: sentence-length check only meaningful on body.
             violations.extend(_check_sentence_length(text, position))
+            # Grammar / rhythm rules (R4, R5, R7 operate on flat text).
+            violations.extend(_check_sentence_opener_repetition(text, position, field))
+            violations.extend(_check_length_rhythm_flat(text, position))
+            violations.extend(_check_comma_stack_parallel(text, position, field))
+            # Paragraph-aware grammar rules (R0, R2, R3, R6) need the RAW
+            # HTML because _strip_html collapses paragraph boundaries.
+            paragraphs = _split_paragraphs(content or "")
+            violations.extend(_check_greeting_too_terse(paragraphs, position))
+            violations.extend(_check_fanboys_density(paragraphs, position))
+            violations.extend(_check_paragraph_opener_monotony(paragraphs, position))
+            violations.extend(_check_paragraph_grammar_uniformity(paragraphs, position))
         violations.extend(_check_banned_phrases(text, position, field))
         violations.extend(_check_banned_adjectives(text, position, field))
         violations.extend(_check_template_phrases(text, position, field))
