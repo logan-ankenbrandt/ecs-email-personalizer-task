@@ -65,6 +65,7 @@ CHECKPOINT_EVERY_N = 50  # write checkpoint after this many recipients complete
 # the LLM was previously making decisions without.
 _RULE_FILES: tuple = (
     "alignment.md",
+    "claims.md",
     "formatting.md",
     "grammar.md",
     "quality.md",
