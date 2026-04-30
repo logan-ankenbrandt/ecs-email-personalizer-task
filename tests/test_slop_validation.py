@@ -11,7 +11,9 @@ Run from any cwd:
 from utils.slop_validation import (
     Violation,
     _check_comma_stack_parallel,
+    _check_fabricated_data_grounding,
     _check_fanboys_density,
+    _check_forbidden_outcome_claims_body,
     _check_greeting_too_terse,
     _check_length_rhythm_flat,
     _check_paragraph_grammar_uniformity,
@@ -446,3 +448,197 @@ def test_integration_pat_email_full_validate():
     # Sanity: every violation conforms to the Violation NamedTuple shape.
     assert all(isinstance(v, Violation) for v in violations)
     assert all(v.severity in {"hard_fail", "deduction"} for v in violations)
+
+
+# ============================================================
+# R8: forbidden_outcome_claim_body
+# ============================================================
+
+def test_r8_positive_4xd_their_pipeline():
+    # "4x'd their pipeline" is the canonical fabricated outcome claim
+    # observed live (Pat step 1, Jonathan step 1).
+    text = "One client 4x'd their pipeline in 90 days with the same team."
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "forbidden_outcome_claim_body"
+    assert violations[0].severity == "hard_fail"
+
+
+def test_r8_positive_doubled_their_pipeline():
+    # "doubled their pipeline" is the verbatim multiplier-form claim.
+    text = "One client doubled their pipeline within a single quarter."
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "forbidden_outcome_claim_body"
+    assert violations[0].severity == "hard_fail"
+
+
+def test_r8_positive_same_bd_team():
+    # "same BD team" is one of the literal forbidden phrases per claims.md.
+    text = "Same BD team, same headcount, no new hires required."
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "forbidden_outcome_claim_body"
+    assert violations[0].severity == "hard_fail"
+
+
+def test_r8_negative_approved_greenbox_phrasing():
+    # The approved Greenbox phrasing ("conversion rate roughly doubled
+    # over a 12-week window") describes a conversion rate, NOT pipeline /
+    # sales / revenue / conversions, and there is no "4x'd their pipeline"
+    # form. Should produce zero violations.
+    text = (
+        "Their conversion rate roughly doubled over a 12-week window, "
+        "which is the kind of result we are aiming for here."
+    )
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert violations == []
+
+
+def test_r8_edge_4x_unrelated_to_pipeline():
+    # "4x bigger team" / "4x the volume" are NOT claims about pipeline,
+    # so the regex (which requires "their|your pipeline" after the
+    # multiplier) must not fire.
+    text = "Their team is 4x bigger than ours and ships 4x the volume."
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert violations == []
+
+
+# ============================================================
+# R9: fabricated_data_grounding
+# ============================================================
+
+def test_r9_positive_approved_proof_point_annotation():
+    # Live MongoDB record: Pat step 1 fabricated this exact entry.
+    data_grounding = [
+        "50-seat OSHA Training Center at Kansas City headquarters",
+        "75 years combined field construction experience among recruiters",
+        "One client 4x'd their pipeline in 90 days (approved proof point)",
+    ]
+    violations = _check_fabricated_data_grounding(
+        data_grounding, position=1,
+    )
+    # The third entry hits BOTH the forbidden-outcome-claim regex AND the
+    # proof-point annotation, but the implementation deduplicates so we
+    # see exactly one violation per entry.
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "fabricated_data_grounding"
+    assert violations[0].severity == "hard_fail"
+    assert violations[0].field == "data_grounding"
+
+
+def test_r9_positive_approved_proof_point_framing_variant():
+    # The "(approved proof point framing)" variant has been observed in
+    # the wild. The regex matches the umbrella "(approved/verified
+    # proof/data point...)" pattern.
+    data_grounding = [
+        "30+ years in market (referral network ceiling threshold)",
+        "Some abstract result (approved proof point framing)",
+    ]
+    violations = _check_fabricated_data_grounding(
+        data_grounding, position=1,
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "fabricated_data_grounding"
+    assert violations[0].severity == "hard_fail"
+
+
+def test_r9_positive_verified_proof_point_variant():
+    # "(verified proof point)" is the second umbrella variant. Same regex
+    # branch.
+    data_grounding = [
+        "Headquartered in Houston (verified proof point)",
+    ]
+    violations = _check_fabricated_data_grounding(
+        data_grounding, position=1,
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "fabricated_data_grounding"
+
+
+def test_r9_negative_legitimate_external_facts():
+    # Real externally-sourced facts about the prospect. None of them
+    # match the forbidden outcome regexes; none contain a proof-point
+    # annotation. Zero violations.
+    data_grounding = [
+        "50-seat OSHA Training Center at Kansas City headquarters",
+        "75 years combined field construction experience among recruiters",
+        "30+ years in market (referral network ceiling threshold)",
+        "San Antonio market (Jonathan's location)",
+    ]
+    violations = _check_fabricated_data_grounding(
+        data_grounding, position=1,
+    )
+    assert violations == []
+
+
+def test_r9_edge_data_grounding_is_none():
+    # Graceful degradation: legacy callers pass nothing. Must return [].
+    violations = _check_fabricated_data_grounding(None, position=1)
+    assert violations == []
+
+
+def test_r9_edge_data_grounding_empty_list():
+    # Empty list also gracefully returns [].
+    violations = _check_fabricated_data_grounding([], position=1)
+    assert violations == []
+
+
+# ============================================================
+# Integration: validate_email threads data_grounding through R9
+# ============================================================
+
+def test_validate_email_threads_data_grounding():
+    # Body is clean. data_grounding contains a fabricated proof point.
+    # The end-to-end call path through validate_email must surface the
+    # R9 violation.
+    clean_body = (
+        "<p>Hi Pat,</p>"
+        "<p>Saw the OSHA Training Center note on your site, that is a real "
+        "differentiator for industrial accounts in this market. "
+        "If you are open to it, I can send a sample campaign next week.</p>"
+        "<p>Logan</p>"
+        '<p><a href="https://withcold.com">Cold</a></p>'
+    )
+    data_grounding = [
+        "OSHA Training Center at Kansas City HQ",
+        "One client 4x'd their pipeline in 90 days (approved proof point)",
+    ]
+    violations = validate_email(
+        subject="Quick note on your training center",
+        content=clean_body,
+        position=1,
+        data_grounding=data_grounding,
+    )
+    pattern_severity_pairs = {(v.pattern_type, v.severity) for v in violations}
+    assert ("fabricated_data_grounding", "hard_fail") in pattern_severity_pairs
+
+
+def test_validate_email_backward_compat_no_data_grounding():
+    # Legacy three-arg call site must still work. No data_grounding kwarg
+    # means R9 simply produces zero violations of its own.
+    clean_body = (
+        "<p>Hi Pat,</p>"
+        "<p>Saw the OSHA Training Center note on your site, that is a real "
+        "differentiator for industrial accounts in this market. "
+        "If you are open to it, I can send a sample campaign next week.</p>"
+        "<p>Logan</p>"
+        '<p><a href="https://withcold.com">Cold</a></p>'
+    )
+    violations = validate_email(
+        subject="Quick note on your training center",
+        content=clean_body,
+        position=1,
+    )
+    pattern_types = {v.pattern_type for v in violations}
+    assert "fabricated_data_grounding" not in pattern_types

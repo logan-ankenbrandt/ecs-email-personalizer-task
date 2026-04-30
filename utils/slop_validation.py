@@ -14,7 +14,7 @@ context to anchor swap tests).
 import logging
 import re
 import statistics
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -562,6 +562,44 @@ SENTENCE_WORD_CAP = 25
 
 
 # ============================================================
+# R8 / R9: forbidden outcome-claim detection.
+#
+# Live MongoDB records show the writer fabricating outcome claims like
+# "One client 4x'd their pipeline in 90 days (approved proof point)" and
+# inserting them into the `data_grounding` list as self-citations. The
+# judge then sees the fake citation in data_grounding and treats it as
+# legitimate, so the personalization_depth cap never fires.
+#
+# These patterns are forbidden by claims.md. Catch them deterministically
+# in BOTH the email body (R8) and the writer's data_grounding list (R9).
+# ============================================================
+
+# Forbidden body regexes shared by R8 and R9.
+#   - "Nx'd their pipeline" / "Nx your pipeline" (any digit, optional 'd)
+#   - "(doubled|tripled|quadrupled) their/your (pipeline|sales|revenue|conversions)"
+#   - "same BD team"
+_FORBIDDEN_OUTCOME_CLAIM_PATTERNS = [
+    re.compile(r"\b\d+x'?d?\s+(?:their|your)\s+pipeline", re.IGNORECASE),
+    re.compile(
+        r"\b(?:doubled|tripled|quadrupled)\s+(?:their|your)\s+"
+        r"(?:pipeline|sales|revenue|conversions)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bsame\s+BD\s+team\b", re.IGNORECASE),
+]
+
+# R9-only: fabricated "approved proof point" annotations the writer
+# attaches to its own self-cited outcome claims in data_grounding.
+# Variants observed live: "(approved proof point)",
+# "(approved proof point framing)", "(verified proof point)",
+# "(approved data point)". Match the umbrella pattern.
+_FABRICATED_PROOF_POINT_RE = re.compile(
+    r"\(\s*(?:approved|verified)\s+(?:proof|data)\s+point[^)]*\)",
+    re.IGNORECASE,
+)
+
+
+# ============================================================
 # Result types
 # ============================================================
 
@@ -621,6 +659,17 @@ class Violation(NamedTuple):
             return "3+ paragraphs share the same first-sentence syntactic pattern"
         if self.pattern_type == "comma_stack_parallel":
             return "3+ comma-joined parallel independent clauses with no conjunction"
+        if self.pattern_type == "forbidden_outcome_claim_body":
+            return (
+                "Forbidden outcome claim in body (e.g., 'Nx'd their pipeline', "
+                "'doubled their sales', 'same BD team'). claims.md prohibits this."
+            )
+        if self.pattern_type == "fabricated_data_grounding":
+            return (
+                "Fabricated data_grounding entry: contains an '(approved proof "
+                "point)' annotation or a forbidden outcome claim. data_grounding "
+                "must be externally-sourced facts, not self-cited claims."
+            )
         return self.pattern_type
 
     def _suggestion(self) -> str:
@@ -790,6 +839,20 @@ class Violation(NamedTuple):
                 "Combine these short sentences with conjunctions (and/but/so) "
                 "into one flowing sentence, or vary the lengths so no three "
                 "in a row are below 12 words."
+            )
+        if self.pattern_type == "forbidden_outcome_claim_body":
+            return (
+                "This phrase is forbidden by claims.md. Replace with one of "
+                "the three approved Greenbox citable phrasings or omit social "
+                "proof entirely."
+            )
+        if self.pattern_type == "fabricated_data_grounding":
+            return (
+                "data_grounding contains a fabricated 'approved proof point' "
+                "annotation or a forbidden outcome claim. data_grounding "
+                "entries must be externally-sourced facts about the prospect, "
+                "not self-cited outcome claims. Remove this entry or replace "
+                "with a real externally-sourced fact."
             )
         return "Rewrite the flagged excerpt."
 
@@ -1250,6 +1313,83 @@ def _check_sentence_length(text: str, position: int) -> List[Violation]:
     return violations
 
 
+def _check_forbidden_outcome_claims_body(
+    text: str, position: int, field: str,
+) -> List[Violation]:
+    """R8: forbidden outcome-claim patterns in the email body.
+
+    Catches the patterns claims.md explicitly prohibits:
+      - "Nx'd their pipeline" / "Nx your pipeline"
+      - "doubled/tripled/quadrupled their|your pipeline|sales|revenue|conversions"
+      - "same BD team"
+
+    Hard fail. Pads excerpt with surrounding context so the refiner sees
+    where the claim sits in the sentence.
+    """
+    violations: List[Violation] = []
+    for regex in _FORBIDDEN_OUTCOME_CLAIM_PATTERNS:
+        for match in regex.finditer(text):
+            start = max(0, match.start() - 30)
+            end = min(len(text), match.end() + 30)
+            violations.append(Violation(
+                pattern_type="forbidden_outcome_claim_body",
+                email_position=position,
+                field=field,
+                excerpt=text[start:end],
+                severity="hard_fail",
+            ))
+    return violations
+
+
+def _check_fabricated_data_grounding(
+    data_grounding: Optional[List[str]], position: int,
+) -> List[Violation]:
+    """R9: fabricated entries in the writer's data_grounding list.
+
+    Two trigger families:
+      1. Any entry matching one of the R8 forbidden body regexes
+         (e.g., "One client 4x'd their pipeline...").
+      2. Any entry containing an "(approved proof point)" /
+         "(approved proof point framing)" / "(verified proof point)" /
+         "(approved data point)" annotation.
+
+    The writer self-cites these fake annotations to satisfy the
+    personalization_depth judge. Hard fail per entry.
+
+    Graceful degradation: returns [] when data_grounding is None or
+    empty, so callers that don't pass it (legacy) keep working.
+    """
+    if not data_grounding:
+        return []
+    violations: List[Violation] = []
+    for entry in data_grounding:
+        if not isinstance(entry, str) or not entry:
+            continue
+        # Forbidden outcome-claim regex hit anywhere in the entry.
+        for regex in _FORBIDDEN_OUTCOME_CLAIM_PATTERNS:
+            if regex.search(entry):
+                violations.append(Violation(
+                    pattern_type="fabricated_data_grounding",
+                    email_position=position,
+                    field="data_grounding",
+                    excerpt=entry[:200],
+                    severity="hard_fail",
+                ))
+                break
+        else:
+            # Only check the proof-point annotation if no outcome-claim
+            # regex already flagged this entry, to avoid double-flagging.
+            if _FABRICATED_PROOF_POINT_RE.search(entry):
+                violations.append(Violation(
+                    pattern_type="fabricated_data_grounding",
+                    email_position=position,
+                    field="data_grounding",
+                    excerpt=entry[:200],
+                    severity="hard_fail",
+                ))
+    return violations
+
+
 def _check_structure(
     subject: str,
     content_text: str,
@@ -1345,8 +1485,20 @@ def _check_banned_adjectives(text: str, position: int, field: str) -> List[Viola
 # Public API
 # ============================================================
 
-def validate_email(subject: str, content: str, position: int) -> List[Violation]:
-    """Validate a single email against all slop patterns. Returns flat list."""
+def validate_email(
+    subject: str,
+    content: str,
+    position: int,
+    data_grounding: Optional[List[str]] = None,
+) -> List[Violation]:
+    """Validate a single email against all slop patterns. Returns flat list.
+
+    `data_grounding`, when provided, is the writer's `data_grounding` list
+    output (see _WRITE_RESULT_TOOL in writer.py). R9 inspects it for
+    fabricated "(approved proof point)" annotations and forbidden outcome
+    claims. Default None preserves backward compatibility with callers
+    that don't have access to the writer output.
+    """
     violations = []
     stripped_content = ""
     for raw, field in [(subject or "", "subject"), (content or "", "content")]:
@@ -1379,6 +1531,10 @@ def validate_email(subject: str, content: str, position: int) -> List[Violation]
             violations.extend(_check_sentence_opener_repetition(text, position, field))
             violations.extend(_check_length_rhythm_flat(text, position))
             violations.extend(_check_comma_stack_parallel(text, position, field))
+            # R8: forbidden outcome-claim regexes in body text.
+            violations.extend(
+                _check_forbidden_outcome_claims_body(text, position, field)
+            )
             # Paragraph-aware grammar rules (R0, R2, R3, R6) need the RAW
             # HTML because _strip_html collapses paragraph boundaries.
             paragraphs = _split_paragraphs(content or "")
@@ -1402,6 +1558,8 @@ def validate_email(subject: str, content: str, position: int) -> List[Violation]
             raw_content=content or "",
         )
     )
+    # R9: fabricated data_grounding inspection. Runs once per email.
+    violations.extend(_check_fabricated_data_grounding(data_grounding, position))
     return violations
 
 

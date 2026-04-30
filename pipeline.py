@@ -1028,6 +1028,10 @@ class PersonalizerPipeline:
         best_judgment: Optional[Dict[str, Any]] = None
         best_judge_score = 0.0
         best_slop_count = 10**9  # lower is better; start sentinel-high
+        # Phase-1 fix: track best-iter hard_fail count separately so the
+        # ranking key can strictly prefer iterations with zero hard_fails over
+        # higher-scoring iterations that still carry violations.
+        best_hard_fail_count = 10**9  # lower is better; start sentinel-high
         iters_done = 0
         for refine_iteration in range(MAX_REFINE_LOOPS + 1):
             iters_done = refine_iteration + 1
@@ -1055,66 +1059,112 @@ class PersonalizerPipeline:
             # violations into the issues list and force should_refine=True
             # regardless of score. Catches em-dashes, banned phrases, and
             # structural bounds that the LLM judge misses.
-            slop_violations = validate_email(subject=subject, content=content, position=step)
+            slop_violations = validate_email(
+                subject=subject,
+                content=content,
+                position=step,
+                data_grounding=data_grounding or None,
+            )
+            # Phase-1 fix: split violations by severity. hard_fail must gate
+            # acceptance and the post-loop upsert; deductions are advisory.
+            hard_fail_violations = [v for v in slop_violations if v.severity == "hard_fail"]
+            deduction_violations = [v for v in slop_violations if v.severity != "hard_fail"]
             if slop_violations:
-                logger.info(
-                    "Recipient=%s step=%d: slop_gate iter=%d violations=%d types=%s",
-                    rid, step, refine_iteration, len(slop_violations),
-                    sorted({v.pattern_type for v in slop_violations})[:5],
-                )
                 slop_issues = [v.to_judge_issue() for v in slop_violations]
                 judgment_issues = list(judgment.get("issues", []) or [])
                 judgment["issues"] = judgment_issues + slop_issues
                 should_refine = True
 
-            # D.3: per-iteration score trajectory. Lets log-investigator
-            # reconstruct judge vs slop trends without rolling up from
-            # indirect signals.
-            logger.info(
-                "refine_iter recipient=%s step=%d iter=%d judge_score=%.3f "
-                "slop_violations=%d should_refine=%s issues=%d",
-                rid, step, refine_iteration, score, len(slop_violations),
-                should_refine, len(judgment.get("issues", []) or []),
-            )
-
-            # B.2: tuple-key ranking. Primary: higher judge score wins.
-            # Tiebreaker: fewer slop violations wins.
             slop_count = len(slop_violations)
-            better_judge = score > best_judge_score
-            same_judge_fewer_slop = score == best_judge_score and slop_count < best_slop_count
-            if better_judge or same_judge_fewer_slop:
+            hard_fail_count = len(hard_fail_violations)
+            deduction_count = len(deduction_violations)
+            hard_fail_types = sorted({v.pattern_type for v in hard_fail_violations})
+
+            # B.2 + Phase-1 fix: tuple-key ranking now strictly prefers
+            # iterations with zero hard_fails. Old ranking was (score,
+            # -slop_count) which let 0.85 + 1 hard_fail beat 0.80 + 0
+            # hard_fails. That's exactly the Jonathan Smith bug: a high-score
+            # iter with greeting_too_terse was promoted to "best" and shipped.
+            # New ranking key: (zero_hard_fail, judge_score, -slop_count).
+            current_zero_hf = hard_fail_count == 0
+            best_zero_hf = best_hard_fail_count == 0
+            better = (
+                (current_zero_hf and not best_zero_hf)
+                or (
+                    current_zero_hf == best_zero_hf
+                    and score > best_judge_score
+                )
+                or (
+                    current_zero_hf == best_zero_hf
+                    and score == best_judge_score
+                    and slop_count < best_slop_count
+                )
+            )
+            if better:
                 best_subject = subject
                 best_content = content
                 best_judgment = judgment
                 best_judge_score = score
                 best_slop_count = slop_count
+                best_hard_fail_count = hard_fail_count
 
-            # Accept only if the score clears the threshold (or judge says stop)
-            # AND slop is clean. slop violations always force another refine.
-            if (score >= effective_threshold or not should_refine) and not slop_violations:
-                logger.info(
-                    "Recipient=%s step=%d: score=%.2f passes (iter=%d, threshold=%.2f, judge=%s)",
-                    rid, step, score, refine_iteration, effective_threshold, judge_model,
-                )
-                break
-
-            # Fix 5 (skip futile refine): if the only failing dimension is
-            # personalization_depth and we have no data, refining cannot help.
-            if not has_website:
+            # Decide what to do with this iteration. The decision string is
+            # logged below for auditability.
+            decision: str
+            # Accept only when the score clears the threshold (or judge says
+            # stop) AND no hard_fail violations remain. Hard fails always
+            # force another refine pass.
+            if (score >= effective_threshold or not should_refine) and not hard_fail_violations:
+                decision = "ship"
+            elif not has_website and not hard_fail_violations:
+                # Fix 5 (skip futile refine): if the only failing dimension is
+                # personalization_depth and we have no data, refining cannot
+                # help. Gated on no hard_fails so we don't escape a bare-name
+                # greeting via this branch.
                 dim_scores = judgment.get("dimension_scores", {}) or {}
-                failing_dims = [k for k, v in dim_scores.items() if isinstance(v, (int, float)) and v < 0.6]
+                failing_dims = [
+                    k for k, v in dim_scores.items()
+                    if isinstance(v, (int, float)) and v < 0.6
+                ]
                 if failing_dims == ["personalization_depth"]:
-                    logger.info(
-                        "Recipient=%s step=%d: skipping refine - no data for personalization_depth",
-                        rid, step,
-                    )
-                    break
-
-            if is_final_iter:
-                logger.info(
-                    "Recipient=%s step=%d: score=%.2f after %d refines, accepting (threshold=%.2f)",
-                    rid, step, score, refine_iteration, effective_threshold,
+                    decision = "skip_futile"
+                elif is_final_iter:
+                    decision = "refine_exhausted"
+                else:
+                    decision = "refine"
+            elif is_final_iter:
+                # Phase-1 fix: max-iter cap honors hard_fails. When the cap
+                # is hit with hard_fails remaining, log distinctly so the
+                # post-loop hard-fail gate can fail the email rather than
+                # silently shipping it.
+                decision = (
+                    "refine_exhausted_with_hard_fails"
+                    if hard_fail_violations
+                    else "refine_exhausted"
                 )
+            else:
+                decision = "refine"
+
+            # Phase-1 fix: structured refine_decision log replaces the prior
+            # refine_iter + slop_gate + accept logs. One grep gives the full
+            # iteration trail (judge_score, hard_fail_count, decision).
+            logger.info(
+                "refine_decision recipient=%s step=%d iter=%d judge_score=%.3f "
+                "hard_fail_count=%d deduction_count=%d slop_count=%d "
+                "should_refine=%s threshold=%.2f decision=%s hard_fail_types=%s "
+                "judge=%s",
+                rid, step, refine_iteration, score,
+                hard_fail_count, deduction_count, slop_count,
+                should_refine, effective_threshold, decision,
+                hard_fail_types[:5], judge_model,
+            )
+
+            if decision in (
+                "ship",
+                "skip_futile",
+                "refine_exhausted",
+                "refine_exhausted_with_hard_fails",
+            ):
                 break
 
             # A5: thread user_feedback into refine so a "don't mention
@@ -1223,8 +1273,34 @@ class PersonalizerPipeline:
             return True, preserved_signal
 
         # Phase 4: Programmatic slop validation
-        slop_violations = validate_email(subject=subject, content=content, position=step)
+        slop_violations = validate_email(
+            subject=subject,
+            content=content,
+            position=step,
+            data_grounding=data_grounding or None,
+        )
         slop_warnings = [v.to_dict() for v in slop_violations]
+
+        # Phase-1 fix: final hard-fail gate. The refine loop made best-effort
+        # attempts to clear hard_fails; if any survived, fail the step rather
+        # than ship at the violating state. Without this gate the upsert below
+        # writes hard_fail violations into slop_warnings and ships the email
+        # at quality_score 0.85+ (the Jonathan Smith greeting_too_terse case).
+        # message_scheduler falls back to the template version when no
+        # personalized doc exists, mirroring the below_hard_floor path above.
+        final_hard_fails = [
+            v for v in slop_violations if v.severity == "hard_fail"
+        ]
+        if final_hard_fails:
+            logger.warning(
+                "step=%d recipient=%s decision=hard_fail_blocked "
+                "hard_fail_count=%d hard_fail_types=%s score=%.2f iters=%d "
+                "had_feedback=%s has_website=%s",
+                step, rid, len(final_hard_fails),
+                sorted({v.pattern_type for v in final_hard_fails})[:5],
+                final_score, iters_done, bool(self.feedback), has_website,
+            )
+            return False, None
 
         # Phase 5: Resolve merge fields (so message_scheduler can skip content_updater)
         resolved_subject = resolve_merge_fields(subject, merge_dict)
