@@ -59,11 +59,6 @@ _PROOF_SIGNATURE_REGEXES: List = [
     # "no new hires" / "no new BD hires" / "no new headcount"
     (re.compile(r"\bno\s+new\s+(?:hires|headcount|BD\s+hires|sales\s+hires)\b", re.IGNORECASE),
      lambda m: "phrase_no_new_hires"),
-    # Delivery / volume stats: "1.7 million emails" or "98.2% delivery"
-    (re.compile(r"\b1\.?7\s*(?:million|m)\s+emails\b", re.IGNORECASE),
-     lambda m: "stat_1_7m_emails"),
-    (re.compile(r"\b98\.2%\b", re.IGNORECASE),
-     lambda m: "stat_98_2_delivery"),
     # "pipeline in N days" / "pipeline in N months"
     (re.compile(r"\bpipeline\s+in\s+\d+\s+(?:days|weeks|months)\b", re.IGNORECASE),
      lambda m: "phrase_pipeline_timeframe"),
@@ -195,8 +190,8 @@ class RecipientMemory:
         or proof point already used in an earlier step.
 
         Round 4.6 A: includes a BANNED PROOF SIGNATURES block listing the
-        normalized signatures already used. v7 recycled "4x pipeline in 90
-        days" across 3 of 4 steps despite the existing prior_summary; the
+        normalized signatures already used. v7 recycled the same proof
+        point across 3 of 4 steps despite the existing prior_summary; the
         explicit banlist is more emphatic than the soft "proof points"
         mention below.
 
@@ -273,8 +268,6 @@ class RecipientMemory:
                 "window_30d": '"30 days" time window',
                 "phrase_same_team": '"same team" / "same BD team"',
                 "phrase_no_new_hires": '"no new hires" / "no new BD hires"',
-                "stat_1_7m_emails": '"1.7 million emails"',
-                "stat_98_2_delivery": '"98.2% delivery rate"',
                 "phrase_pipeline_timeframe": '"pipeline in N days/weeks/months"',
                 "phrase_msa_count": '"N new MSA clients/relationships"',
             }
@@ -287,7 +280,7 @@ class RecipientMemory:
                 "steps. Do NOT reuse them in this step. Pick a different "
                 "proof point or different framing:\n- "
                 + "\n- ".join(banned_phrases)
-                + "\n\nIf the only approved proof point you can remember is "
+                + "\n\nIf the proof point you'd typically reach for is "
                 "already banned, use the recipient's own numbers (years in "
                 "business, placement count, locations) as your proof instead."
             )

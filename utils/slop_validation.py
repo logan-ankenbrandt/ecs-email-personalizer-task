@@ -575,17 +575,31 @@ SENTENCE_WORD_CAP = 25
 # ============================================================
 
 # Forbidden body regexes shared by R8 and R9.
-#   - "Nx'd their pipeline" / "Nx your pipeline" (any digit, optional 'd)
+#   - "Nx'd pipeline" / "Nx their pipeline" / "Nx your pipeline"
+#     (any digit, optional 'd, optional possessive). Round 5 broadened
+#     the possessive to optional after live evidence showed
+#     "4x'd pipeline" without "their" slipping past the original regex.
 #   - "(doubled|tripled|quadrupled) their/your (pipeline|sales|revenue|conversions)"
 #   - "same BD team"
+#   - Multiplier-after-noun: "pipeline grow 4x", "sales jumped 3x"
+#     (pipeline/sales/revenue/conversions ... NxN). Round 5 addition;
+#     the writer was evading the prefix form by reordering the multiplier
+#     to follow the noun phrase.
 _FORBIDDEN_OUTCOME_CLAIM_PATTERNS = [
-    re.compile(r"\b\d+x'?d?\s+(?:their|your)\s+pipeline", re.IGNORECASE),
+    re.compile(
+        r"\b\d+x'?d?\s+(?:(?:their|your)\s+)?pipeline\b",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"\b(?:doubled|tripled|quadrupled)\s+(?:their|your)\s+"
         r"(?:pipeline|sales|revenue|conversions)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\bsame\s+BD\s+team\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:pipeline|sales|revenue|conversions)[\w\s]{0,40}\b\d+x\b",
+        re.IGNORECASE,
+    ),
 ]
 
 # R9-only: fabricated "approved proof point" annotations the writer
@@ -597,6 +611,50 @@ _FABRICATED_PROOF_POINT_RE = re.compile(
     r"\(\s*(?:approved|verified)\s+(?:proof|data)\s+point[^)]*\)",
     re.IGNORECASE,
 )
+
+# R9 (Round 5): colon / dash / comma / whitespace-prefix variant of the
+# proof-point annotation. Live evidence: data_grounding entries like
+# "Approved proof point: one client 4x'd pipeline in 90 days" slipped
+# past the parens-only regex. Match the literal annotation token
+# followed by any non-paren separator. "infrastructure point" added so
+# variants like "Verified infrastructure point" also match.
+_FABRICATED_PROOF_POINT_PREFIX_RE = re.compile(
+    r"\b(?:approved|verified|confirmed)\s+"
+    r"(?:proof|data|infrastructure)\s+point[\s:,\-]",
+    re.IGNORECASE,
+)
+
+# R10: unsourced platform-stat detection. Numeric performance stats
+# ("98.2% delivery rate", "1.7 million emails sent") that the writer
+# cannot legitimately cite because no Cold-platform case study has been
+# approved in claims.md. Currently only the Greenbox case study has
+# verified facts; presence of the literal "Greenbox" token in the text
+# acts as a whitelist gate. Once additional case studies exist in
+# claims.md, expand the gate.
+_UNSOURCED_STAT_PATTERNS = [
+    re.compile(
+        r"\b\d+(?:\.\d+)?%\s+"
+        r"(?:delivery|deliverability|conversion|reply|click|open|bounce)\b",
+        re.IGNORECASE,
+    ),
+    # Keyword-before-percent variant. Same evasion class as R8's
+    # word-order issue: live evidence (Jonathan step 3) shows
+    # "Delivery runs at 98.2%" phrasing where the keyword precedes
+    # the percentage with up to ~30 characters of glue between them
+    # ("runs at", "rate of", "rate at"). The 0-30 char window keeps
+    # the match tight enough to avoid spanning unrelated sentences.
+    re.compile(
+        r"\b(?:delivery|deliverability|conversion|reply|click|open|bounce)"
+        r"[\w\s]{0,30}\b\d+(?:\.\d+)?%",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b\d+(?:[.,]\d+)?\s*(?:million|thousand|m|k)\s+"
+        r"(?:emails|sends|messages)\b",
+        re.IGNORECASE,
+    ),
+]
+_GREENBOX_TOKEN_RE = re.compile(r"\bGreenbox\b", re.IGNORECASE)
 
 
 # ============================================================
@@ -670,6 +728,8 @@ class Violation(NamedTuple):
                 "point)' annotation or a forbidden outcome claim. data_grounding "
                 "must be externally-sourced facts, not self-cited claims."
             )
+        if self.pattern_type == "unsourced_platform_stat":
+            return "Numeric statistic not citable from any case study in claims.md."
         return self.pattern_type
 
     def _suggestion(self) -> str:
@@ -842,17 +902,28 @@ class Violation(NamedTuple):
             )
         if self.pattern_type == "forbidden_outcome_claim_body":
             return (
-                "This phrase is forbidden by claims.md. Replace with one of "
-                "the three approved Greenbox citable phrasings or omit social "
-                "proof entirely."
+                "REMOVE this outcome claim entirely. Do not rephrase the "
+                "multiplier. The only acceptable alternative is omission, "
+                "leaving the email's pain framing and offer commitment to "
+                "carry the conversation without social proof. If you must "
+                "include social proof, use one of the three approved "
+                "Greenbox citable phrasings from claims.md verbatim."
             )
         if self.pattern_type == "fabricated_data_grounding":
             return (
-                "data_grounding contains a fabricated 'approved proof point' "
-                "annotation or a forbidden outcome claim. data_grounding "
-                "entries must be externally-sourced facts about the prospect, "
-                "not self-cited outcome claims. Remove this entry or replace "
-                "with a real externally-sourced fact."
+                "REMOVE this data_grounding entry. Do not rephrase. "
+                "data_grounding entries must be externally-sourced facts "
+                "about the prospect (their company, role, market signals), "
+                "not self-cited outcome claims. Self-citing with annotations "
+                "like 'approved proof point' is forbidden in any form."
+            )
+        if self.pattern_type == "unsourced_platform_stat":
+            return (
+                "Statistic is not citable from any case study in claims.md. "
+                "REMOVE this statistic. Do not invent or assert platform-wide "
+                "numbers. Currently only the Greenbox case study has verified "
+                "facts; cite Greenbox by name if you need to use the "
+                "statistic, otherwise omit it entirely."
             )
         return "Rewrite the flagged excerpt."
 
@@ -1346,12 +1417,19 @@ def _check_fabricated_data_grounding(
 ) -> List[Violation]:
     """R9: fabricated entries in the writer's data_grounding list.
 
-    Two trigger families:
+    Three trigger families (any one fires hard_fail per entry, with
+    deduplication so an entry that matches multiple families produces
+    a single violation):
       1. Any entry matching one of the R8 forbidden body regexes
          (e.g., "One client 4x'd their pipeline...").
-      2. Any entry containing an "(approved proof point)" /
-         "(approved proof point framing)" / "(verified proof point)" /
-         "(approved data point)" annotation.
+      2. Any entry containing a parenthesized proof-point annotation:
+         "(approved proof point)", "(approved proof point framing)",
+         "(verified proof point)", "(approved data point)".
+      3. Any entry containing a colon / dash / comma / whitespace
+         prefix proof-point annotation: "Approved proof point: ...",
+         "Verified data point - ...", etc. Round 5 addition; the
+         writer was evading the parens form by switching to colon
+         separators.
 
     The writer self-cites these fake annotations to satisfy the
     personalization_depth judge. Hard fail per entry.
@@ -1365,6 +1443,7 @@ def _check_fabricated_data_grounding(
     for entry in data_grounding:
         if not isinstance(entry, str) or not entry:
             continue
+        flagged = False
         # Forbidden outcome-claim regex hit anywhere in the entry.
         for regex in _FORBIDDEN_OUTCOME_CLAIM_PATTERNS:
             if regex.search(entry):
@@ -1375,18 +1454,62 @@ def _check_fabricated_data_grounding(
                     excerpt=entry[:200],
                     severity="hard_fail",
                 ))
+                flagged = True
                 break
-        else:
-            # Only check the proof-point annotation if no outcome-claim
-            # regex already flagged this entry, to avoid double-flagging.
-            if _FABRICATED_PROOF_POINT_RE.search(entry):
-                violations.append(Violation(
-                    pattern_type="fabricated_data_grounding",
-                    email_position=position,
-                    field="data_grounding",
-                    excerpt=entry[:200],
-                    severity="hard_fail",
-                ))
+        if flagged:
+            continue
+        # Parens-form proof-point annotation.
+        if _FABRICATED_PROOF_POINT_RE.search(entry):
+            violations.append(Violation(
+                pattern_type="fabricated_data_grounding",
+                email_position=position,
+                field="data_grounding",
+                excerpt=entry[:200],
+                severity="hard_fail",
+            ))
+            continue
+        # Prefix-form proof-point annotation (colon / dash / comma /
+        # whitespace separator).
+        if _FABRICATED_PROOF_POINT_PREFIX_RE.search(entry):
+            violations.append(Violation(
+                pattern_type="fabricated_data_grounding",
+                email_position=position,
+                field="data_grounding",
+                excerpt=entry[:200],
+                severity="hard_fail",
+            ))
+    return violations
+
+
+def _check_unsourced_platform_stats(
+    text: str, position: int, field: str,
+) -> List[Violation]:
+    """R10: numeric platform stats with no citable case-study source.
+
+    Catches percentage stats ("98.2% delivery rate", "57% click rate")
+    and volume stats ("1.7 million emails sent", "500K messages") that
+    the writer cannot legitimately cite. claims.md currently lists
+    Greenbox as the only verified case study source, so the literal
+    "Greenbox" token in the surrounding text acts as the whitelist
+    gate. When a Cold-platform case study is approved, expand the gate.
+
+    Hard fail. Pads excerpt with surrounding context so the refiner
+    sees where the stat sits in the sentence.
+    """
+    if _GREENBOX_TOKEN_RE.search(text):
+        return []
+    violations: List[Violation] = []
+    for regex in _UNSOURCED_STAT_PATTERNS:
+        for match in regex.finditer(text):
+            start = max(0, match.start() - 30)
+            end = min(len(text), match.end() + 30)
+            violations.append(Violation(
+                pattern_type="unsourced_platform_stat",
+                email_position=position,
+                field=field,
+                excerpt=text[start:end],
+                severity="hard_fail",
+            ))
     return violations
 
 
@@ -1534,6 +1657,11 @@ def validate_email(
             # R8: forbidden outcome-claim regexes in body text.
             violations.extend(
                 _check_forbidden_outcome_claims_body(text, position, field)
+            )
+            # R10: unsourced platform stats (gated by the literal
+            # "Greenbox" token, the only currently-verified source).
+            violations.extend(
+                _check_unsourced_platform_stats(text, position, field)
             )
             # Paragraph-aware grammar rules (R0, R2, R3, R6) need the RAW
             # HTML because _strip_html collapses paragraph boundaries.

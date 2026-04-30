@@ -91,7 +91,7 @@ GOOD: "The messaging is built around light industrial hiring. I write the campai
 11. "Every/all" universality claims. Drop the universal quantifier.
 12. Template CTAs: "Curious if this is on your radar" verbatim.
 13. Threshold-free diagnosis: if you claim something "plateaus," "stops scaling," "hits a ceiling," or "carries you to a point," you MUST include a concrete number or timeframe. BAD: "Referral networks carry you to a point, then they plateau." GOOD: "Once a trades staffing firm has 15+ GC relationships, the referral network stops producing new ones." The threshold is what makes the diagnosis non-generic.
-14. Math-promise without math: if the subject line or body promises "the math," "the numbers," or "ROI," the body MUST contain at least one concrete dollar figure, multiplier, or percentage. BAD subject "the math on one new GC client" + body "meaningful return." GOOD: "one client 4x'd their pipeline."
+14. Math-promise without math: if the subject line or body promises "the math," "the numbers," or "ROI," the body MUST contain at least one concrete dollar figure, multiplier, or percentage. BAD subject "the math on one new GC client" + body "meaningful return." GOOD: "Their conversion rate from contact-to-customer roughly doubled over a 12-week window."
 15. Adverb-participle slop: "actively pulling," "consistently delivering," "currently expanding." The verb alone is stronger. Permits are either being pulled or they aren't — "actively" adds nothing.
 
 ### Banned Phrases
@@ -137,8 +137,7 @@ After writing each email, re-read every sentence and ask: "Have I seen this exac
 - No `&mdash;` or `&ndash;` HTML entities.
 
 ### Alignment
-- Every specific claim must trace to: lead_data, company_brief, approved_proof_point, or segment_knowledge
-- Approved proof points: "1.7 million emails at 98.2% delivery rate", "one client 4x'd their pipeline in 90 days"
+- Every specific claim must trace to: lead_data, company_brief, or segment_knowledge
 - Do NOT fabricate case studies or claim Cold has staffing clients
 - Do NOT invent statistics. If the brief says "673 placements", use 673. Do not round to 700.
 - If no data exists for a claim, omit the claim. Never fabricate a number.
@@ -190,7 +189,7 @@ The bottleneck at your stage is usually on the client acquisition side. Once a l
 
 I build outbound campaigns that reach warehouse operations managers and plant HR directors in the San Antonio DMA. The messaging is built around light industrial hiring.
 
-One client 4x'd their pipeline in 90 days through managed outbound. Same team, no new hires on the sales side.
+Another Cold customer's conversion rate from contact-to-customer roughly doubled over a 12-week window. Same team, no new hires on the BD side.
 
 Curious if this matches what you're seeing at FirstOption.
 

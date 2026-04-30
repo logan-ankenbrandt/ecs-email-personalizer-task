@@ -68,8 +68,7 @@ After writing each email, re-read every sentence and ask: "Have I seen this exac
 - HTML: `<p>` tags for paragraphs
 
 ### Alignment
-- Every specific claim must trace to: lead_data, company_brief, approved_proof_point, or segment_knowledge
-- Approved proof points: "1.7 million emails at 98.2% delivery rate", "one client 4x'd their pipeline in 90 days"
+- Every specific claim must trace to: lead_data, company_brief, or segment_knowledge
 - Do NOT fabricate case studies or claim Cold has staffing clients
 
 ### Staffing Language
@@ -86,7 +85,7 @@ Return ONLY valid JSON. No markdown fencing. No explanation.
   "company_insight": "one sentence: what you found and how you used it",
   "data_grounding": [
     {"claim": "673 placements", "source": "company_brief"},
-    {"claim": "4x pipeline in 90 days", "source": "approved_proof_point"}
+    {"claim": "Greenbox conversion rate roughly doubled over a 12-week window", "source": "case_study"}
   ],
   "swap_test_notes": [
     "Sentence 1: references 673 placements, specific to FirstOption",

@@ -87,6 +87,9 @@ STEP_ROLES: Dict[int, str] = {
         "Value Bridge (Email 2 of N). Explain how the system works. Show what "
         "it looks like in practice for a firm like theirs. Tier 1 CTA: passive, "
         "curiosity-based. No meeting ask."
+        " Length cap: 140 words. HARD RULE: do NOT re-explain Cold's offering. "
+        "Reference the step 1 hook explicitly (e.g., 'back to the OSHA Training "
+        "Center angle...'). Build forward, do not restart."
     ),
     3: (
         "ROI Proof (Email 3 of N). Show the math. Make the investment feel "
@@ -94,6 +97,8 @@ STEP_ROLES: Dict[int, str] = {
         "HARD RULE: do NOT restate the recipient's company description. If this "
         "sequence uses the same proof point as an earlier step, swap to a "
         "different metric or framing."
+        " Length cap: 120 words. HARD RULE: do NOT re-explain Cold's offering. "
+        "The recipient has read steps 1 and 2; reference them, do not restart."
     ),
     4: (
         "Breakup (Email 4 of N). Last touch. Gentle urgency through timing "
@@ -102,6 +107,8 @@ STEP_ROLES: Dict[int, str] = {
         "repeat the diagnosis from earlier emails. Reader has already heard "
         "it. Pivot to a NEW angle: timing, a different proof point, or a "
         "fresh data observation."
+        " Length cap: 90 words. HARD RULE: do NOT re-explain Cold's offering. "
+        "Pure timing-truth or break-up tone. Reference what was already said."
     ),
 }
 
@@ -204,15 +211,22 @@ _PROOF_POINT_REGEXES: Tuple[re.Pattern, ...] = (
 _HTML_TAG_RE_PIPELINE = re.compile(r"<[^>]+>")
 
 
-def _extract_reuse_signals(accepted_body: str) -> Dict[str, str]:
+def _extract_reuse_signals(
+    accepted_body: str, accepted_subject: str = "",
+) -> Dict[str, str]:
     """C.2: pull out opener + proof-point markers from an accepted body.
 
     Returns dict with keys:
       - opener: first plain-text sentence of the body (signature line)
       - proof_points: semicolon-joined matched proof-point excerpts
+      - body_excerpt: first 400 chars of the plain-text body (for thread
+        continuity rendering, so step N+1's writer can SEE what step N said)
+      - subject: the accepted subject line (passed through verbatim)
 
     These are injected into the next step's writer prompt as explicit "don't
-    recycle" constraints. Sequence-level defect, not per-email.
+    recycle" constraints AND as full prior-step context so the writer can
+    reference earlier steps instead of re-explaining Cold's offering.
+    Sequence-level defect, not per-email.
     """
     if not accepted_body:
         return {}
@@ -240,7 +254,17 @@ def _extract_reuse_signals(accepted_body: str) -> Dict[str, str]:
                 seen.add(key)
                 matches.append(val)
 
-    return {"opener": opener, "proof_points": "; ".join(matches[:8])}
+    # Thread continuity: surface a 400-char excerpt of the prior body and the
+    # full subject so the next step's writer can reference earlier steps
+    # rather than re-explain Cold's offering each time.
+    body_excerpt = plain[:400]
+
+    return {
+        "opener": opener,
+        "proof_points": "; ".join(matches[:8]),
+        "body_excerpt": body_excerpt,
+        "subject": accepted_subject or "",
+    }
 
 
 def _load_system_prompt() -> Tuple[str, int]:
@@ -431,6 +455,30 @@ def _build_writer_user_prompt(
         )
         prior_steps_block = "\n".join(lines) + "\n\n---\n\n"
 
+    # Thread continuity: surface the FULL subject + opener + body excerpt of
+    # each prior accepted step so the writer can reference what was already
+    # said instead of re-explaining Cold's offering. The "don't recycle"
+    # block above tells the writer what NOT to repeat; this block tells the
+    # writer what was actually written so they can build forward from it.
+    prior_thread_block = ""
+    if prior_step_signals:
+        thread_sections: List[str] = ["## What you said in earlier steps"]
+        for sig in prior_step_signals:
+            s_step = sig.get("step", "?")
+            s_subject = (sig.get("subject") or "").strip()
+            s_opener = (sig.get("opener") or "").strip()
+            s_excerpt = (sig.get("body_excerpt") or "").strip()
+            section_lines: List[str] = [""]
+            if s_subject:
+                section_lines.append(f"Step {s_step} subject: {s_subject}")
+            if s_opener:
+                section_lines.append(f"Step {s_step} opener: {s_opener}")
+            if s_excerpt:
+                section_lines.append(f"Step {s_step} body excerpt:")
+                section_lines.append(s_excerpt)
+            thread_sections.append("\n".join(section_lines))
+        prior_thread_block = "\n".join(thread_sections) + "\n\n---\n\n"
+
     # T1.2: calibration anchor. When a gold-standard example loaded,
     # prepend it as a reference so the writer sees what 0.92 looks like.
     calibration_block = ""
@@ -453,6 +501,7 @@ def _build_writer_user_prompt(
         f"{step_role_block}"
         f"{vocab_block}"
         f"{prior_steps_block}"
+        f"{prior_thread_block}"
         f"{calibration_block}"
         f"## Template (the baseline written for the segment)\n\n"
         f"### Subject\n{template_subject}\n\n"
@@ -1268,7 +1317,9 @@ class PersonalizerPipeline:
             # existing copy is preserved. No upsert needed. Emit a signal
             # built from the PRIOR accepted content so later steps still see
             # the prior opener / proof points and can avoid recycling.
-            preserved_signal = _extract_reuse_signals(prev_content or "")
+            preserved_signal = _extract_reuse_signals(
+                prev_content or "", prev_subject or "",
+            )
             preserved_signal["step"] = str(step)
             return True, preserved_signal
 
@@ -1344,10 +1395,11 @@ class PersonalizerPipeline:
         # C.2: extract opener + proof-point markers from the accepted body
         # so later steps in this recipient's sequence can be told "don't
         # recycle these". Uses the PRE-merge-field content so the signals
-        # reflect what the writer actually produced.
+        # reflect what the writer actually produced. Subject is also
+        # captured so the next step's prompt can reference it verbatim.
         signal: Optional[Dict[str, str]] = None
         if ok:
-            signal = _extract_reuse_signals(content or "")
+            signal = _extract_reuse_signals(content or "", subject or "")
             signal["step"] = str(step)
         return ok, signal
 

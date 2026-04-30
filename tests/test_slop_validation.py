@@ -20,6 +20,7 @@ from utils.slop_validation import (
     _check_paragraph_opener_monotony,
     _check_sentence_opener_repetition,
     _check_staccato,
+    _check_unsourced_platform_stats,
     validate_email,
 )
 
@@ -642,3 +643,209 @@ def test_validate_email_backward_compat_no_data_grounding():
     )
     pattern_types = {v.pattern_type for v in violations}
     assert "fabricated_data_grounding" not in pattern_types
+
+
+# ============================================================
+# R8 Round 5: word-order evasions (multiplier-after-noun, no possessive)
+# ============================================================
+
+def test_r8_positive_multiplier_after_noun():
+    # Live evidence (Pat step 2 body): the writer reordered the multiplier
+    # to follow the noun phrase to evade the original prefix-form regex.
+    text = "One client saw their pipeline grow 4x in 90 days through managed outbound."
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert any(
+        v.pattern_type == "forbidden_outcome_claim_body"
+        and v.severity == "hard_fail"
+        for v in violations
+    )
+
+
+def test_r8_positive_4xd_pipeline_no_possessive():
+    # Live evidence: "4x'd pipeline in 90 days" without "their"/"your"
+    # slipped past the original possessive-required regex.
+    text = "One client 4x'd pipeline in 90 days."
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert any(
+        v.pattern_type == "forbidden_outcome_claim_body"
+        and v.severity == "hard_fail"
+        for v in violations
+    )
+
+
+def test_r8_negative_approved_greenbox_conversion_phrasing():
+    # The approved Greenbox citable phrasing describes a conversion rate,
+    # not pipeline / sales / revenue / conversions doubling. No forbidden
+    # outcome regex should match.
+    text = "Their conversion rate roughly doubled over a 12-week window."
+    violations = _check_forbidden_outcome_claims_body(
+        text, position=1, field="content",
+    )
+    assert violations == []
+
+
+# ============================================================
+# R9 Round 5: colon-prefix proof-point annotations
+# ============================================================
+
+def test_r9_positive_colon_prefix_approved_proof_point():
+    # Live evidence (Pat step 2 data_grounding): the writer switched to
+    # a colon separator to evade the parens-only regex.
+    data_grounding = [
+        "Approved proof point: one client 4x'd pipeline in 90 days",
+    ]
+    violations = _check_fabricated_data_grounding(
+        data_grounding, position=1,
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "fabricated_data_grounding"
+    assert violations[0].severity == "hard_fail"
+
+
+def test_r9_negative_unrelated_approved_phrase():
+    # "Approved by the QA team for shipment" is a different domain entirely:
+    # no "proof point" / "data point" / "infrastructure point" token after
+    # "approved", so the prefix regex must not fire.
+    data_grounding = [
+        "Approved by the QA team for shipment",
+    ]
+    violations = _check_fabricated_data_grounding(
+        data_grounding, position=1,
+    )
+    assert violations == []
+
+
+# ============================================================
+# R10: unsourced_platform_stat
+# ============================================================
+
+def test_r10_positive_percentage_and_volume_combined():
+    # The writer asserts both a percentage stat and an emails-sent
+    # volume in the same sentence with no Greenbox citation. Two
+    # violations expected: one from the "<num>% delivery|conversion|..."
+    # pattern, one from the "<num> million emails|sends|messages" pattern.
+    text = "We hit 98.2% delivery on 1.7 million emails last quarter."
+    violations = _check_unsourced_platform_stats(
+        text, position=1, field="content",
+    )
+    assert len(violations) == 2
+    assert all(
+        v.pattern_type == "unsourced_platform_stat"
+        and v.severity == "hard_fail"
+        for v in violations
+    )
+
+
+def test_r10_positive_percentage_alone():
+    # A single delivery-rate percentage with no Greenbox token nearby.
+    text = "We hit 98.2% delivery rate across our infrastructure."
+    violations = _check_unsourced_platform_stats(
+        text, position=1, field="content",
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "unsourced_platform_stat"
+    assert violations[0].severity == "hard_fail"
+
+
+def test_r10_positive_keyword_before_percent_word_order():
+    # Live evidence (Jonathan step 3): the writer evaded the original
+    # percent-then-keyword regex by reordering to keyword-then-percent
+    # ("Delivery runs at 98.2%"). The new regex with a 0-30 char glue
+    # window between the keyword and the percentage catches it.
+    text = "Delivery runs at 98.2% across the infrastructure."
+    violations = _check_unsourced_platform_stats(
+        text, position=1, field="content",
+    )
+    assert len(violations) == 1
+    assert violations[0].pattern_type == "unsourced_platform_stat"
+    assert violations[0].severity == "hard_fail"
+
+
+def test_r10_negative_greenbox_gate_present():
+    # The literal "Greenbox" token whitelists the entire text. Two stat
+    # patterns appear (14.5% conversion and 29.5% conversion) but R10
+    # short-circuits when Greenbox is present.
+    text = "Greenbox saw a 14.5% to 29.5% conversion rate over 12 weeks."
+    violations = _check_unsourced_platform_stats(
+        text, position=1, field="content",
+    )
+    assert violations == []
+
+
+def test_r10_negative_non_stat_number():
+    # "75 years of combined construction experience" is a domain fact
+    # about the prospect, not a percentage or volume stat. R10 must not
+    # match because the regex requires a percent sign or a million/thousand
+    # quantifier next to emails/sends/messages.
+    text = "75 years of combined construction experience across the firm."
+    violations = _check_unsourced_platform_stats(
+        text, position=1, field="content",
+    )
+    assert violations == []
+
+
+# ============================================================
+# Integration: R8 word-order + R10 stats via validate_email
+# ============================================================
+
+PAT_STEP_2_BODY_FRAGMENT = (
+    "<p>Hi Pat,</p>"
+    "<p>The construction clients you serve are fielding project delays "
+    "right now because GCs cannot staff field crews fast enough. "
+    "One client saw their pipeline grow 4x in 90 days through managed "
+    "outbound.</p>"
+    "<p>If you want to see what a campaign looks like, I can send a sample.</p>"
+    "<p>Logan</p>"
+    '<p><a href="https://withcold.com">Cold</a></p>'
+)
+
+
+def test_integration_pat_step_2_word_order_evasion_caught():
+    # End-to-end: validate_email on the verbatim Pat step 2 body must
+    # surface the new multiplier-after-noun R8 hard_fail.
+    violations = validate_email(
+        subject="Houston EPC hiring",
+        content=PAT_STEP_2_BODY_FRAGMENT,
+        position=2,
+    )
+    pattern_severity_pairs = {(v.pattern_type, v.severity) for v in violations}
+    assert ("forbidden_outcome_claim_body", "hard_fail") in pattern_severity_pairs
+
+
+JONATHAN_STEP_3_BODY_FRAGMENT = (
+    "<p>Hi Jonathan,</p>"
+    "<p>The infrastructure side of the platform is where we put most of "
+    "the engineering effort. "
+    "Delivery runs at 98.2% across 1.7 million emails sent.</p>"
+    "<p>Worth a sample if you want to see how this would look for your "
+    "San Antonio campaigns.</p>"
+    "<p>Logan</p>"
+    '<p><a href="https://withcold.com">Cold</a></p>'
+)
+
+
+def test_integration_jonathan_step_3_unsourced_stats_caught():
+    # End-to-end: validate_email on the verbatim Jonathan step 3 body
+    # must surface TWO R10 hard_fails: one from the keyword-before-
+    # percent pattern ("Delivery runs at 98.2%"), one from the volume
+    # pattern ("1.7 million emails"). No Greenbox token whitelists
+    # the body, so both fire.
+    violations = validate_email(
+        subject="San Antonio outbound",
+        content=JONATHAN_STEP_3_BODY_FRAGMENT,
+        position=3,
+    )
+    r10_violations = [
+        v for v in violations
+        if v.pattern_type == "unsourced_platform_stat"
+        and v.severity == "hard_fail"
+    ]
+    assert len(r10_violations) == 2, (
+        f"expected 2 R10 hard_fails (percentage + volume) on Jonathan "
+        f"step 3, got {len(r10_violations)}: "
+        f"{[v.excerpt for v in r10_violations]}"
+    )
